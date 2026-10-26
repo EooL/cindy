@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { ScriptTarget, transpileModule } from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
-import { canResumeAfterRuntimeFallback, isBotCandidateUnavailable } from '../botCandidateRecovery';
+import { canResumeAfterRuntimeFallback, isAccountUsageExhausted, isBotCandidateUnavailable, isSameAccountRoute } from '../botCandidateRecovery';
 import { isInterruptedTurnError, isAcceptedTurnContinuationOnlyReason } from '../interruptedTurnAutoResume';
 
 const source = readFileSync(new URL('../register.ts', import.meta.url), 'utf8');
@@ -19,7 +19,7 @@ function harness(bot = true) {
   const guard = vi.fn(() => ({ action: 'resume', attempt: 1, maxAttempts: 5,
     episodeAttempt: 1, maxEpisodeAttempts: 10, sessionTotal: 1, attemptToken: 1, delayMs: 1000 }));
   const deps = {
-    isInterruptedTurnError, isBotCandidateUnavailable, canResumeAfterRuntimeFallback,
+    isInterruptedTurnError, isAccountUsageExhausted, isBotCandidateUnavailable, canResumeAfterRuntimeFallback,
     isAcceptedTurnContinuationOnlyReason,
     inputCoordinator: { isExecutionPaused: () => false, autoRetryLastError: resume },
     interruptedTurnAutoResumeGuard: { onInterruptedTurn: guard, noteResumeSendFailed: vi.fn() },
@@ -66,14 +66,13 @@ describe('Bot candidate recovery', () => {
     expect(h.isResumableTurnErrorCandidate(signals, h.item)).toBe(true);
     expect(h.onResumableTurnError('s', signals, h.item)).not.toBeNull();
     await h.run();
-    expect(h.fallback).toHaveBeenCalledWith('s', 1, 1, true, expect.any(Function));
+    expect(h.fallback).toHaveBeenCalledWith('s', 1, 1, true, expect.any(Function), false);
     expect(h.resume).toHaveBeenCalledOnce();
   });
 
   it.each([
     { reason: 'user_denied' }, { reason: 'context_overflow' },
     { sdkError: 'invalid_request' },
-    { message: "You've hit your session limit: budget_exceeded" },
   ])('preserves explicit failures despite session-limit text %j', (override) => {
     expect(isBotCandidateUnavailable({ message: "You've hit your session limit", ...override })).toBe(false);
   });
@@ -85,7 +84,7 @@ describe('Bot candidate recovery', () => {
     expect(h.isResumableTurnErrorCandidate(signals, h.item)).toBe(true);
     expect(h.onResumableTurnError('s', signals, h.item)).not.toBeNull();
     await h.run();
-    expect(h.fallback).toHaveBeenCalledWith('s', 1, 1, true, expect.any(Function));
+    expect(h.fallback).toHaveBeenCalledWith('s', 1, 1, true, expect.any(Function), false);
     expect(h.resume).toHaveBeenCalledTimes(outcome === 'switched' ? 1 : 0);
     if (outcome === 'exhausted') expect(h.finalize).toHaveBeenCalledWith('s', 1, { surfaceBanner: true });
   });
@@ -118,17 +117,39 @@ describe('Bot candidate recovery', () => {
     expect(isBotCandidateUnavailable(signals)).toBe(false);
   });
 
-  // Gateway budget exhaustion is account-level: no candidate on the same account can
-  // recover it, so the shared deterministic-exhaustion signal wins over the 429 (#5266).
+  // Account exhaustion cannot be recovered on the same account (#5266), but a configured
+  // candidate on another account can take over. Codex sends `usageLimitExceeded` with
+  // "You've hit your usage limit" and no HTTP status; the structured tag is authoritative.
   const budgetExceeded = '429: {"message":"ExceededBudget: User=[REDACTED] over budget. Spend=0.0, Budget=0.0","type":"budget_exceeded","code":"429"}';
+  const codexUsageLimit = { codexErrorInfo: 'usageLimitExceeded', message: "You've hit your usage limit. Upgrade to Pro or try again at 10:55 PM." };
   it.each([
+    codexUsageLimit,
+    { codexErrorInfo: 'usageLimitExceeded' },
+    { sdkError: 'billing_error' },
     { errorStatus: 429, message: budgetExceeded },
     { reason: 'turn-failed', errorStatus: 429, message: budgetExceeded },
     { sdkError: 'rate_limit', message: 'Request failed: budget_exceeded' },
     { errorStatus: 429, message: 'You exceeded your current quota, please check your plan and billing details.' },
     { message: 'insufficient_quota' },
-  ])('keeps the account budget exhaustion with the user instead of switching candidates %j', (signals) => {
+    { message: "You've hit your session limit: budget_exceeded" },
+  ])('switches only to another account on account exhaustion %j', (signals) => {
+    expect(isBotCandidateUnavailable(signals)).toBe(true);
+    expect(isAccountUsageExhausted(signals)).toBe(true);
+  });
+
+  it.each([
+    { reason: 'context_overflow', codexErrorInfo: 'usageLimitExceeded' },
+    { reason: 'user_denied', message: 'insufficient_quota' },
+  ])('keeps explicit control reasons ahead of account exhaustion %j', (signals) => {
     expect(isBotCandidateUnavailable(signals)).toBe(false);
+  });
+
+  it('identifies routes that share the exhausted account', () => {
+    const current = { harness: 'codex', providerId: 'openai', agentDeviceId: null };
+    expect(isSameAccountRoute({ harness: 'codex', providerId: 'openai' }, current)).toBe(true);
+    expect(isSameAccountRoute({ harness: 'codex', providerId: 'gemini' }, current)).toBe(false);
+    expect(isSameAccountRoute({ harness: 'claude', providerId: 'openai' }, current)).toBe(false);
+    expect(isSameAccountRoute({ harness: 'codex', providerId: 'openai', agentDeviceId: 'other-pc' }, current)).toBe(false);
   });
 
   it.each([
@@ -139,13 +160,28 @@ describe('Bot candidate recovery', () => {
     expect(isBotCandidateUnavailable(signals)).toBe(true);
   });
 
-  it('does not schedule Bot fallback or auto-resume for a gateway budget exhaustion', () => {
+  it('asks the Bot fallback to skip the exhausted account and resumes after a switch', async () => {
     const h = harness();
-    const signals = { errorStatus: 429, message: budgetExceeded };
-    expect(h.isResumableTurnErrorCandidate(signals, h.item)).toBe(false);
-    expect(h.onResumableTurnError('s', signals, h.item)).toBeNull();
-    expect(h.guard).not.toHaveBeenCalled();
-    expect(h.fallback).not.toHaveBeenCalled();
+    expect(h.isResumableTurnErrorCandidate(codexUsageLimit, h.item)).toBe(true);
+    expect(h.onResumableTurnError('s', codexUsageLimit, h.item)).not.toBeNull();
+    await h.run();
+    expect(h.fallback).toHaveBeenCalledWith('s', 1, 1, true, expect.any(Function), true);
+    expect(h.resume).toHaveBeenCalledWith('s', 1);
+  });
+
+  it('surfaces account exhaustion when no other account is configured', async () => {
+    const h = harness();
+    h.fallback.mockResolvedValue({ session: null, outcome: 'exhausted' });
+    h.onResumableTurnError('s', { errorStatus: 429, message: budgetExceeded }, h.item);
+    await h.run();
+    expect(h.resume).not.toHaveBeenCalled();
+    expect(h.finalize).toHaveBeenCalledWith('s', 1, { surfaceBanner: true });
+  });
+
+  it('keeps ordinary sessions out of account-exhaustion recovery', () => {
+    const h = harness(false);
+    expect(h.isResumableTurnErrorCandidate(codexUsageLimit, h.item)).toBe(false);
+    expect(h.onResumableTurnError('s', codexUsageLimit, h.item)).toBeNull();
   });
 
   const drop = { reason: 'pi-gateway-drop', message: 'Connection error.' };
@@ -159,7 +195,7 @@ describe('Bot candidate recovery', () => {
     expect(bot.onResumableTurnError('s', drop, bot.item)).not.toBeNull();
     expect(bot.resume).not.toHaveBeenCalled();
     await bot.run();
-    expect(bot.fallback).toHaveBeenCalledWith('s', 1, 1, true, expect.any(Function));
+    expect(bot.fallback).toHaveBeenCalledWith('s', 1, 1, true, expect.any(Function), false);
     expect(bot.resume).toHaveBeenCalledWith('s', 1);
   });
 
@@ -177,7 +213,7 @@ describe('Bot candidate recovery', () => {
     h.fallback.mockResolvedValue({ session: null, outcome: 'unchanged' });
     h.onResumableTurnError('s', { message: 'Connection error.' }, h.item);
     await h.run();
-    expect(h.fallback).toHaveBeenCalledWith('s', 1, 1, false, expect.any(Function));
+    expect(h.fallback).toHaveBeenCalledWith('s', 1, 1, false, expect.any(Function), false);
     expect(h.resume).toHaveBeenCalledOnce();
   });
 

@@ -1483,6 +1483,8 @@ import {
 } from './interruptedTurnAutoResume.js';
 import { readInterruptedTurnAutoResumeSettings } from '../maker-host/interrupted-turn-auto-resume-store.js';
 import {
+  isAccountUsageExhausted,
+  isSameAccountRoute,
   isBotCandidateUnavailable,
   canResumeAfterRuntimeFallback,
   type RuntimeFallbackResult,
@@ -16823,6 +16825,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     sessionId: string,
     current: SessionRuntimeProfile,
     controlSessionId = sessionId,
+    excludeFailedAccount = false,
   ): Promise<{ isBot: boolean; candidate: SessionRuntimeProfile | null }> => {
     const [row] = await getDbClient()
       .drizzle.select({
@@ -16879,7 +16882,8 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       chain,
       { harness: currentHarness, model: current.model, providerId: current.providerId, agentDeviceId: current.agentDeviceId },
       control.visitedRoutes,
-      (candidate) => !controlSession?.remoteHostId || candidate.harness === currentHarness,
+      (candidate) => (!controlSession?.remoteHostId || candidate.harness === currentHarness) &&
+        !(excludeFailedAccount && isSameAccountRoute(candidate, { ...current, harness: currentHarness })),
     );
     return {
       isBot: true,
@@ -16942,6 +16946,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     attemptToken: number,
     requireRouteChange = false,
     isCurrent: () => boolean = () => true,
+    excludeFailedAccount = false,
   ): Promise<RuntimeFallbackResult<Session>> => {
     const runtimeOwnerEpoch = captureSessionRuntimeControlOwnerEpoch();
     let runtimeSession: Session | null = null;
@@ -16961,7 +16966,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       // Bot routes are explicit and ordered. They switch on the first recoverable
       // failure and never depend on the generic Session fallback toggle/catalog
       // guesser. Ordinary Sessions keep their existing second-attempt behavior.
-      const botFallback = await readBotFallbackCandidate(sessionId, profiles.effective);
+      const botFallback = await readBotFallbackCandidate(sessionId, profiles.effective, sessionId, excludeFailedAccount);
       if (!isCurrent()) return { session: null, outcome: 'superseded' };
       let currentForFallback = profiles.effective;
       let candidate = botFallback.candidate;
@@ -17032,7 +17037,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         failed: SessionRuntimeProfile,
       ): Promise<boolean> => {
         if (!await recordFailedCandidate(failed) || !botFallback.isBot) return false;
-        const next = await readBotFallbackCandidate(sessionId, currentForFallback);
+        const next = await readBotFallbackCandidate(sessionId, currentForFallback, sessionId, excludeFailedAccount);
         candidate = next.candidate;
         return candidate !== null;
       };
@@ -19778,6 +19783,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     ) => {
       if (!canRecoverTurn(signals, item) || inputCoordinator.isExecutionPaused(sessionId)) return null;
       const requireRouteChange = botFallbackInputs.has(item.createOpts) && isBotCandidateUnavailable(signals);
+      const excludeFailedAccount = requireRouteChange && isAccountUsageExhausted(signals);
       const erroredAt = Date.now();
       const decision = interruptedTurnAutoResumeGuard.onInterruptedTurn(sessionId, erroredAt);
       if (decision.action !== 'resume') {
@@ -19840,6 +19846,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
                 decision.attemptToken,
                 requireRouteChange,
                 () => attempt.isCurrent() && !inputCoordinator.isExecutionPaused(sessionId),
+                excludeFailedAccount,
               );
               fallbackRebuildSession = fallback.session;
               if (!attempt.isCurrent()) return;
