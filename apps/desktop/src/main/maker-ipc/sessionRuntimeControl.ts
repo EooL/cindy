@@ -334,12 +334,15 @@ export function recordFailedSessionRuntimeFallbackCandidate(
 
 export function recordSkippedSessionRuntimeFallbackRoutes(
   sessionId: string,
+  expectedGeneration: number,
   routeKeys: readonly string[],
-): void {
+): boolean {
   const state = stateFor(sessionId);
+  if (state.generation !== expectedGeneration) return false;
   for (const key of routeKeys) {
     state.visitedRoutes.add(key);
   }
+  return true;
 }
 
 export function settlePendingSessionRuntimeMutation(

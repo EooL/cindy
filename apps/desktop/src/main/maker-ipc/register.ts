@@ -16827,6 +16827,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     current: SessionRuntimeProfile,
     controlSessionId = sessionId,
     excludeFailedAccount = false,
+    expectedGeneration?: number,
   ): Promise<{ isBot: boolean; candidate: SessionRuntimeProfile | null }> => {
     const [row] = await getDbClient()
       .drizzle.select({
@@ -16875,13 +16876,14 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       : current.agentKind === 'pi'
         ? 'pi'
         : 'claude';
+    const control = getSessionRuntimeControlSnapshot(controlSessionId);
     if (excludeFailedAccount) {
+      const targetGeneration = expectedGeneration ?? control.generation;
       const exhaustedKeys = chain
         .filter((candidate) => isSameAccountRoute(candidate, { ...current, harness: currentHarness }))
         .map(botModelRouteRuntimeKey);
-      recordSkippedSessionRuntimeFallbackRoutes(controlSessionId, exhaustedKeys);
+      recordSkippedSessionRuntimeFallbackRoutes(controlSessionId, targetGeneration, exhaustedKeys);
     }
-    const control = getSessionRuntimeControlSnapshot(controlSessionId);
     const [controlSession] = controlSessionId === sessionId ? [{ remoteHostId: row.remoteHostId }]
       : await getDbClient().drizzle.select({ remoteHostId: sessions.remoteHostId })
         .from(sessions).where(eq(sessions.id, controlSessionId)).limit(1);
@@ -16973,7 +16975,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       // Bot routes are explicit and ordered. They switch on the first recoverable
       // failure and never depend on the generic Session fallback toggle/catalog
       // guesser. Ordinary Sessions keep their existing second-attempt behavior.
-      const botFallback = await readBotFallbackCandidate(sessionId, profiles.effective, sessionId, excludeFailedAccount);
+      const botFallback = await readBotFallbackCandidate(sessionId, profiles.effective, sessionId, excludeFailedAccount, profiles.control.generation);
       if (!isCurrent()) return { session: null, outcome: 'superseded' };
       let currentForFallback = profiles.effective;
       let candidate = botFallback.candidate;
@@ -17044,7 +17046,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         failed: SessionRuntimeProfile,
       ): Promise<boolean> => {
         if (!await recordFailedCandidate(failed) || !botFallback.isBot) return false;
-        const next = await readBotFallbackCandidate(sessionId, currentForFallback, sessionId, excludeFailedAccount);
+        const next = await readBotFallbackCandidate(sessionId, currentForFallback, sessionId, excludeFailedAccount, profiles.control.generation);
         candidate = next.candidate;
         return candidate !== null;
       };

@@ -126,6 +126,7 @@ describe('Bot candidate recovery', () => {
   it.each([
     codexUsageLimit,
     { codexErrorInfo: 'usageLimitExceeded' },
+    { codexErrorInfo: 'sessionBudgetExceeded' },
     { sdkError: 'billing_error' },
     { errorStatus: 429, message: budgetExceeded },
     { reason: 'turn-failed', errorStatus: 429, message: budgetExceeded },
@@ -169,6 +170,13 @@ describe('Bot candidate recovery', () => {
     expect(isSameAccountRoute({ harness: 'claude', providerId: null }, currentSub)).toBe(true);
     expect(isSameAccountRoute({ harness: 'codex', providerId: null }, currentSub)).toBe(false);
     expect(isSameAccountRoute({ harness: 'claude', providerId: 'openai' }, currentSub)).toBe(false);
+
+    // Implicit Pi gateway aliases (null, xd, cindy) resolve to the same canonical provider account
+    const piGateway = { harness: 'pi', providerId: null, agentDeviceId: null };
+    expect(isSameAccountRoute({ harness: 'pi', providerId: 'xd' }, piGateway)).toBe(true);
+    expect(isSameAccountRoute({ harness: 'pi', providerId: 'cindy' }, piGateway)).toBe(true);
+    expect(isSameAccountRoute({ harness: 'codex', providerId: 'xd' }, piGateway)).toBe(true);
+    expect(isSameAccountRoute({ harness: 'pi', providerId: 'custom-byom' }, piGateway)).toBe(false);
   });
 
   it.each([

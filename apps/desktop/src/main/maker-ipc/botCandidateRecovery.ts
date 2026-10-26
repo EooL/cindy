@@ -8,7 +8,7 @@ import type { InterruptedTurnErrorSignals } from './interruptedTurnAutoResume.js
  * authoritative; the shared deterministic text is the fallback for untagged envelopes.
  */
 export function isAccountUsageExhausted(signals: InterruptedTurnErrorSignals): boolean {
-  if (signals.codexErrorInfo === 'usageLimitExceeded' || signals.sdkError === 'billing_error') return true;
+  if (signals.codexErrorInfo === 'usageLimitExceeded' || signals.codexErrorInfo === 'sessionBudgetExceeded' || signals.sdkError === 'billing_error') return true;
   // 402 Payment Required is account-level for every provider.
   if (signals.errorStatus === 402) return true;
   // Claude subscription limits carry a structured reset time from the SDK rate_limit_event.
@@ -24,13 +24,22 @@ export function isAccountUsageExhausted(signals: InterruptedTurnErrorSignals): b
 
 export type AccountRoute = { harness: string; providerId?: string | null; agentDeviceId?: string | null };
 
+/** Resolve implicit aliases (e.g. Pi null / xd / cindy gateway) to their canonical provider identity. */
+export function canonicalAccountProvider(route: AccountRoute): string | null {
+  const provider = route.providerId ?? null;
+  if (route.harness === 'pi' && (provider === null || provider === 'xd' || provider === 'cindy')) {
+    return 'xd';
+  }
+  return provider;
+}
+
 /** Same harness, source and device: an exhausted account cannot be recovered by this route. */
 export function isSameAccountRoute(candidate: AccountRoute, current: AccountRoute): boolean {
   if ((candidate.agentDeviceId ?? null) !== (current.agentDeviceId ?? null)) {
     return false;
   }
-  const candidateProvider = candidate.providerId ?? null;
-  const currentProvider = current.providerId ?? null;
+  const candidateProvider = canonicalAccountProvider(candidate);
+  const currentProvider = canonicalAccountProvider(current);
   if (candidateProvider !== null || currentProvider !== null) {
     return candidateProvider === currentProvider;
   }
