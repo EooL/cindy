@@ -33,7 +33,10 @@ class Handler:
     def send_response(self, status): self.status = status
     def send_header(self, key, value): self.headers[key] = value
     def end_headers(self): pass
-    def _send_json(self, status, obj): self.status, self.json = status, obj
+    def _verify_origin(self): return bridge.OpenCodeBridgeHandler._verify_origin(self)
+    def _send_json(self, status, obj):
+        self.status, self.json = status, obj
+        bridge.OpenCodeBridgeHandler._send_json(self, status, obj)
 
 
 class BridgeTests(unittest.TestCase):
@@ -557,6 +560,82 @@ class BridgeTests(unittest.TestCase):
         bridge.OpenCodeBridgeHandler.do_POST(handler)
         self.assertEqual(handler.status, 400)
         self.assertEqual(handler.json["error"]["code"], "invalid_request")
+
+    def test_cors_blocks_untrusted_origins_and_permits_local_and_extension(self):
+        handler = Handler()
+        handler.headers = {"Origin": "https://malicious.website.com"}
+
+        # Untrusted origin blocked on GET, POST, OPTIONS
+        handler.path = "/v1/models"
+        bridge.OpenCodeBridgeHandler.do_GET(handler)
+        self.assertEqual(handler.status, 403)
+        self.assertNotIn("Access-Control-Allow-Origin", handler.headers)
+
+        handler.path = "/v1/chat/completions"
+        bridge.OpenCodeBridgeHandler.do_POST(handler)
+        self.assertEqual(handler.status, 403)
+        self.assertNotIn("Access-Control-Allow-Origin", handler.headers)
+
+        bridge.OpenCodeBridgeHandler.do_OPTIONS(handler)
+        self.assertEqual(handler.status, 403)
+        self.assertNotIn("Access-Control-Allow-Origin", handler.headers)
+
+        # Trusted origins allowed
+        for trusted in ["http://localhost:3000", "http://127.0.0.1:8080", "vscode-webview://my-panel", "chrome-extension://abcdef"]:
+            with self.subTest(trusted=trusted):
+                h = Handler()
+                h.headers = {"Origin": trusted}
+                h.path = "/health"
+                bridge.OpenCodeBridgeHandler.do_GET(h)
+                self.assertEqual(h.status, 200)
+                self.assertEqual(h.headers.get("Access-Control-Allow-Origin"), trusted)
+
+                h2 = Handler()
+                h2.headers = {"Origin": trusted}
+                bridge.OpenCodeBridgeHandler.do_OPTIONS(h2)
+                self.assertEqual(h2.status, 204)
+                self.assertEqual(h2.headers.get("Access-Control-Allow-Origin"), trusted)
+
+    def test_image_data_url_attached_as_file_part_and_stripped_from_text_envelope(self):
+        captured_payload = None
+        def fake_run(conv, payload):
+            nonlocal captured_payload
+            captured_payload = payload
+
+        transport = OpenCodeTransport("http://127.0.0.1:9999", request_json=lambda *a, **kw: {"id": "ses_1"}, stream_open=lambda conv: io.BytesIO(b""))
+        img_data = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe this image:"},
+                {"type": "image_url", "image_url": {"url": img_data}}
+            ]
+        }]
+        with patch.object(transport, "_run", side_effect=fake_run):
+            conv = transport._new({"model": "test-model", "messages": messages}, [{"id": "test-model", "provider": "opencode"}])
+            try:
+                self.assertIsNotNone(captured_payload)
+                parts = captured_payload["parts"]
+                self.assertEqual(len(parts), 2)
+                # Part 0 is text envelope: must contain the placeholder, NOT the raw base64 string
+                self.assertEqual(parts[0]["type"], "text")
+                self.assertIn("[attached image (image/png)]", parts[0]["text"])
+                self.assertNotIn("iVBORw0KGgo", parts[0]["text"])
+
+                # Part 1 is the actual file attachment with the data URL
+                self.assertEqual(parts[1]["type"], "file")
+                self.assertEqual(parts[1]["mime"], "image/png")
+                self.assertEqual(parts[1]["url"], img_data)
+            finally:
+                transport._close(conv, abort=False)
+
+        with self.assertRaises(BridgeError) as raised:
+            transport._new({"model": "test-model", "messages": [{
+                "role": "user",
+                "content": [{"type": "image_url", "image_url": {"url": "ftp://example.com/bad.png"}}]
+            }]}, [{"id": "test-model", "provider": "opencode"}])
+        self.assertEqual(raised.exception.status, 400)
+        self.assertEqual(raised.exception.code, "unsupported_image")
 
 
 if __name__ == '__main__':

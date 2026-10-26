@@ -15,6 +15,7 @@ from pathlib import Path
 import shutil
 import signal
 import os
+import re
 import socketserver
 import sqlite3
 from contextlib import closing
@@ -272,6 +273,17 @@ if hasattr(signal, "SIGBREAK"):
 atexit.register(TRANSPORT.shutdown)
 
 
+TRUSTED_ORIGIN_RE = re.compile(r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$")
+
+
+def is_trusted_origin(origin: str | None) -> bool:
+    if not origin:
+        return True
+    if origin.startswith("chrome-extension://") or origin.startswith("vscode-webview://"):
+        return True
+    return bool(TRUSTED_ORIGIN_RE.match(origin))
+
+
 class OpenCodeBridgeHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -285,24 +297,47 @@ class OpenCodeBridgeHandler(http.server.BaseHTTPRequestHandler):
         except (ConnectionResetError, BrokenPipeError):
             self.close_connection = True
 
+    def _verify_origin(self) -> str | None:
+        origin = self.headers.get("Origin") if hasattr(self, "headers") and self.headers else None
+        if not origin:
+            return None
+        if is_trusted_origin(origin):
+            return origin
+        return False
+
     def _send_json(self, status, obj):
         body = json.dumps(obj).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        origin_header = self._verify_origin()
+        if origin_header:
+            self.send_header("Access-Control-Allow-Origin", origin_header)
+            self.send_header("Vary", "Origin")
         self.end_headers()
         self.wfile.write(body)
 
     def do_OPTIONS(self):
+        origin = self.headers.get("Origin") if hasattr(self, "headers") and self.headers else None
+        if origin and not is_trusted_origin(origin):
+            self.send_response(403)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "*")
+        if origin and is_trusted_origin(origin):
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "*")
         self.send_header("Content-Length", "0")
         self.end_headers()
 
     def do_GET(self):
+        origin = self.headers.get("Origin") if hasattr(self, "headers") and self.headers else None
+        if origin and not is_trusted_origin(origin):
+            self._send_json(403, {"error": {"type": "forbidden", "code": "forbidden", "message": "Cross-origin request blocked."}})
+            return
         path = self.path.split("?", 1)[0]
 
         if path.startswith("/mcp/"):
@@ -369,6 +404,10 @@ class OpenCodeBridgeHandler(http.server.BaseHTTPRequestHandler):
         self._send_json(404, {"error": {"message": f"Not found: {path}"}})
 
     def do_POST(self):
+        origin = self.headers.get("Origin") if hasattr(self, "headers") and self.headers else None
+        if origin and not is_trusted_origin(origin):
+            self._send_json(403, {"error": {"type": "forbidden", "code": "forbidden", "message": "Cross-origin request blocked."}})
+            return
         path = self.path.split("?", 1)[0]
         try:
             length = int(self.headers.get("Content-Length", "0"))

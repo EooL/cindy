@@ -368,14 +368,16 @@ class OpenCodeTransport:
             conversation.session_id = session["id"]
             # Preserve roles, tool IDs, and multimodal blocks in a lossless history envelope.
             # System instructions stay in OpenCode's system field, never in a user role.
+            # Strip bulky base64 data URLs from the history text envelope to avoid duplicate token consumption.
             system = "\n\n".join(m["content"] for m in request["messages"]
                                   if m.get("role") in ("system", "developer") and isinstance(m.get("content"), str))
             history = [m for m in request["messages"] if m.get("role") not in ("system", "developer")]
-            payload = {"model": {"providerID": provider, "modelID": model}, "agent": "cindy-bridge", "tools": tool_flags,
-                       "system": system, "parts": [{"type": "text", "text": json.dumps({"conversation": history}, ensure_ascii=False)}]}
+            file_parts = []
+            sanitized_history = []
             for message in history:
                 content = message.get("content")
                 if isinstance(content, list):
+                    sanitized_blocks = []
                     for block in content:
                         if isinstance(block, dict) and block.get("type") == "image_url":
                             url = (block.get("image_url") or {}).get("url", "")
@@ -383,7 +385,23 @@ class OpenCodeTransport:
                             if parsed.scheme not in ("http", "https", "data"):
                                 raise BridgeError(400, "unsupported_image", "Images require an HTTPS/HTTP or data URL.")
                             mime = url[5:].split(";", 1)[0] if url.startswith("data:") else mimetypes.guess_type(parsed.path)[0]
-                            payload["parts"].append({"type": "file", "mime": mime or "image/png", "url": url})
+                            file_parts.append({"type": "file", "mime": mime or "image/png", "url": url})
+                            clean_block = dict(block)
+                            clean_info = dict(block.get("image_url") or {})
+                            clean_info["url"] = f"[attached image ({mime or 'image'})]"
+                            clean_block["image_url"] = clean_info
+                            sanitized_blocks.append(clean_block)
+                        else:
+                            sanitized_blocks.append(block)
+                    clean_msg = dict(message)
+                    clean_msg["content"] = sanitized_blocks
+                    sanitized_history.append(clean_msg)
+                else:
+                    sanitized_history.append(message)
+
+            payload = {"model": {"providerID": provider, "modelID": model}, "agent": "cindy-bridge", "tools": tool_flags,
+                       "system": system, "parts": [{"type": "text", "text": json.dumps({"conversation": sanitized_history}, ensure_ascii=False)}]}
+            payload["parts"].extend(file_parts)
             effort = request.get("reasoning_effort")
             if effort and effort != "none":
                 if not match or effort not in match.get("efforts", []):
