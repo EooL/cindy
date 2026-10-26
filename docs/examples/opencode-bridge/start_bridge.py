@@ -13,10 +13,14 @@ from opencode_cindy_bridge import opencode_command
 
 def environment(state):
     env = dict(os.environ)
-    original_config = env.get("OPENCODE_BRIDGE_CONFIG", str(
-        Path(env.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "opencode/opencode.json"))
+    config_env = env.get("OPENCODE_BRIDGE_CONFIG")
+    if config_env:
+        resolved_config = Path(config_env).resolve()
+    else:
+        resolved_config = (Path(env.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "opencode/opencode.json").resolve()
+    original_config = str(resolved_config)
     # OpenCode itself reads the selected provider config. Never copy/parse keys.
-    if Path(original_config).exists():
+    if resolved_config.exists():
         env["OPENCODE_CONFIG"] = original_config
     env["OPENCODE_BRIDGE_CONFIG"] = original_config
     profile = state / "config"

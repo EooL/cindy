@@ -229,6 +229,7 @@ class OpenCodeTransport:
             # Discover built-in and configured MCP tools, then disable all of them.
             ids = self.request_json("/experimental/tool/ids", conversation)
             tool_flags = {name: False for name in ids}
+            declared_relay_ids = set()
             if tools:
                 result = self.request_json("/mcp", conversation, {"name": conversation.prefix, "config": {
                     "type": "remote", "url": self.callback_base + "/mcp/" + token,
@@ -236,13 +237,17 @@ class OpenCodeTransport:
                 if (result or {}).get(conversation.prefix, {}).get("status") != "connected":
                     raise BridgeError(502, "mcp_connection_failed", "OpenCode could not connect to the Cindy tool relay.")
                 # MCP definitions are exposed with their native OpenCode namespace.
+                # Restrict enablement strictly to declared relay tool IDs so that unrelated
+                # MCP namespaces (e.g. cindy_extra_*) remain disabled.
+                declared_relay_ids = {conversation.prefix + "_" + name for name in tools}
                 ids = self.request_json("/experimental/tool/ids", conversation)
-                tool_flags = {name: name.startswith(conversation.prefix + "_") for name in ids}
-                for name in tools:
-                    tool_flags[conversation.prefix + "_" + name] = True
+                tool_flags = {name: (name in declared_relay_ids) for name in ids}
+                for relay_id in declared_relay_ids:
+                    tool_flags[relay_id] = True
             permissions = [{"permission": "*", "pattern": "*", "action": "deny"}]
-            if tools:
-                permissions.append({"permission": conversation.prefix + "_*", "pattern": "*", "action": "allow"})
+            if declared_relay_ids:
+                for relay_id in sorted(declared_relay_ids):
+                    permissions.append({"permission": relay_id, "pattern": "*", "action": "allow"})
             session = self.request_json("/session", conversation,
                 {"title": "Cindy Bridge: " + token, "permission": permissions})
             conversation.session_id = session["id"]
