@@ -162,6 +162,16 @@ class OpenCodeTransport:
         for conversation in expired:
             self._close(conversation)
 
+    def shutdown(self):
+        """Close all active bridge conversations and remove temporary state."""
+        with self.lock:
+            active = list(self.conversations.values())
+        for conversation in active:
+            try:
+                self._close(conversation, abort=True)
+            except Exception:
+                pass
+
     def _close(self, conversation, abort=True):
         if conversation.closed.is_set():
             return

@@ -101,12 +101,15 @@ def main():
     finally:
         for child in reversed(children):
             if child.poll() is None:
-                child.terminate()
                 try:
+                    child.terminate()
                     child.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    child.kill()
-                    child.wait()
+                except (subprocess.TimeoutExpired, OSError):
+                    try:
+                        child.kill()
+                        child.wait()
+                    except OSError:
+                        pass
 
 
 if __name__ == "__main__":

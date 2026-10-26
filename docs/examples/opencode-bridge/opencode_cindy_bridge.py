@@ -7,11 +7,13 @@ OpenCode. Relays native MCP tools to Cindy and measured per-response token usage
 SQLite telemetry is explicitly global OpenCode activity, not an account quota.
 """
 
+import atexit
 import http.server
 import json
 import math
 from pathlib import Path
 import shutil
+import signal
 import os
 import socketserver
 import sqlite3
@@ -245,6 +247,30 @@ def build_quota_payload():
 TRANSPORT = OpenCodeTransport(f"http://127.0.0.1:{OPENCODE_SERVER_PORT}")
 
 
+def _graceful_signal_handler(signum, frame):
+    try:
+        TRANSPORT.shutdown()
+    except Exception:
+        pass
+    sys.exit(0)
+
+
+try:
+    signal.signal(signal.SIGINT, _graceful_signal_handler)
+except (ValueError, AttributeError):
+    pass
+try:
+    signal.signal(signal.SIGTERM, _graceful_signal_handler)
+except (ValueError, AttributeError):
+    pass
+if hasattr(signal, "SIGBREAK"):
+    try:
+        signal.signal(signal.SIGBREAK, _graceful_signal_handler)
+    except (ValueError, AttributeError):
+        pass
+atexit.register(TRANSPORT.shutdown)
+
+
 class OpenCodeBridgeHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -385,6 +411,10 @@ def main():
     except KeyboardInterrupt:
         print("[INFO] Shutting down OpenCode bridge.")
     finally:
+        try:
+            TRANSPORT.shutdown()
+        except Exception:
+            pass
         server.server_close()
 
 if __name__ == "__main__":

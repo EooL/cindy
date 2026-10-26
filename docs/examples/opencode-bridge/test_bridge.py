@@ -367,6 +367,15 @@ class BridgeTests(unittest.TestCase):
         finally:
             transport._close(conv, abort=False)
 
+    def test_transport_shutdown_closes_all_active_conversations(self):
+        closed = []
+        transport = OpenCodeTransport("http://unused")
+        with patch.object(transport, "_close", side_effect=lambda conv, abort=True: closed.append(conv.token)):
+            transport.conversations["tok_1"] = Conversation("tok_1", "/tmp/1", "model", {}, "auto")
+            transport.conversations["tok_2"] = Conversation("tok_2", "/tmp/2", "model", {}, "auto")
+            transport.shutdown()
+            self.assertEqual(set(closed), {"tok_1", "tok_2"})
+
 
 if __name__ == '__main__':
     unittest.main()
