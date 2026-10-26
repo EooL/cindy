@@ -426,7 +426,14 @@ class OpenCodeTransport:
             result = self.request_json(f"/session/{conversation.session_id}/message", conversation, payload)
             info = (result or {}).get("info", {})
             if info.get("error"):
-                raise BridgeError(502, "opencode_inference_failed", "OpenCode inference failed: " + str(info["error"].get("name", "unknown error")))
+                error = info["error"]
+                data = error.get("data") if isinstance(error.get("data"), dict) else {}
+                upstream = data.get("statusCode")
+                # Pass the provider's own reason (credits, bad schema, unknown model) so Cindy
+                # does not report a client-side failure as "network unreachable"; bounded in size.
+                detail = str(data.get("message") or error.get("name") or "unknown error")[:500]
+                status = upstream if isinstance(upstream, int) and 400 <= upstream < 500 else 502
+                raise BridgeError(status, "opencode_inference_failed", "OpenCode inference failed: " + detail)
             usage = None
             try:
                 # Telemetry retrieval is optional; bound it to a short timeout (default 5s)

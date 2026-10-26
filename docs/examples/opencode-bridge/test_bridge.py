@@ -134,6 +134,20 @@ class BridgeTests(unittest.TestCase):
                         self.assertEqual(raised.exception.status, 502)
                         self.assertIsNone(handler.json)
 
+    def test_inference_error_keeps_provider_reason_and_client_status(self):
+        cases = [({'name': 'APIError', 'data': {'message': 'insufficient_credits', 'statusCode': 402}}, 402, 'insufficient_credits'),
+                 ({'name': 'APIError', 'data': {'message': 'overloaded', 'statusCode': 503}}, 502, 'overloaded'),
+                 ({'name': 'ProviderModelNotFoundError'}, 502, 'ProviderModelNotFoundError')]
+        for error, status, detail in cases:
+            with self.subTest(status=status):
+                transport = OpenCodeTransport('http://unused', request_json=lambda *args, **kw: {'info': {'error': error}})
+                conversation = Conversation('fixture', '/fixture', 'fixture', {}, 'auto')
+                transport._run(conversation, {})
+                kind, raised = conversation.events.get_nowait()
+                self.assertEqual(kind, 'error')
+                self.assertEqual(raised.status, status)
+                self.assertIn(detail, str(raised))
+
     def test_client_disconnect_aborts_opencode_before_first_delta(self):
         aborted = False
         def mock_request(path, conversation, body=None, method=None, timeout=None):
