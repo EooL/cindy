@@ -8,6 +8,7 @@ Run: python -m unittest discover -s docs/examples/opencode-bridge -p test_bridge
 import importlib.util
 import io
 import json
+import os
 import pathlib
 import sqlite3
 from contextlib import closing
@@ -219,6 +220,29 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(kind, 'done')
         self.assertEqual(result['parts'][0]['text'], 'Completed successfully')
         self.assertIsNone(usage)
+
+    def test_telemetry_fetch_bounds_timeout_and_does_not_stall(self):
+        recorded_timeouts = []
+        def mock_request(path, conversation, body=None, timeout=None):
+            recorded_timeouts.append(timeout)
+            if body is not None:
+                return {'info': {'finish': 'stop'}, 'parts': [{'type': 'text', 'text': 'Done'}]}
+            raise TimeoutError("Simulated upstream telemetry stall")
+
+        transport = OpenCodeTransport('http://unused', timeout=300, request_json=mock_request)
+        conversation = Conversation('fixture', '/fixture', 'fixture', {}, 'auto', session_id='ses_123')
+        transport._run(conversation, {'model': {'providerID': 'opencode', 'modelID': 'fixture'}, 'parts': []})
+        kind, (result, usage) = conversation.events.get_nowait()
+        self.assertEqual(kind, 'done')
+        self.assertEqual(result['parts'][0]['text'], 'Done')
+        self.assertIsNone(usage)
+        self.assertEqual(recorded_timeouts, [None, 5.0])
+
+        # Test custom OPENCODE_TELEMETRY_TIMEOUT override
+        recorded_timeouts.clear()
+        with patch.dict(os.environ, {'OPENCODE_TELEMETRY_TIMEOUT': '1.5'}):
+            transport._run(conversation, {'model': {'providerID': 'opencode', 'modelID': 'fixture'}, 'parts': []})
+            self.assertEqual(recorded_timeouts, [None, 1.5])
 
     def test_concurrent_model_discovery_is_single_flight(self):
         discover_calls = 0

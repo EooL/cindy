@@ -115,13 +115,22 @@ class OpenCodeTransport:
         if request_json is not None:
             import inspect
             sig = inspect.signature(request_json)
-            has_method = any(p.name == "method" or p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
-            if not has_method:
-                def wrapped_request_json(path, conversation, body=None, method=None):
-                    return request_json(path, conversation, body)
-                self.request_json = wrapped_request_json
-            else:
-                self.request_json = request_json
+            params = sig.parameters.values()
+            accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
+            has_method = accepts_kwargs or any(p.name == "method" for p in params)
+            has_timeout = accepts_kwargs or any(p.name == "timeout" for p in params)
+            pos_params = [p for p in params if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)]
+
+            def wrapped_request_json(path, conversation, body=None, method=None, timeout=None):
+                kwargs = {}
+                if has_method and method is not None:
+                    kwargs["method"] = method
+                if has_timeout and timeout is not None:
+                    kwargs["timeout"] = timeout
+                if len(pos_params) == 2 and not accepts_kwargs:
+                    return request_json(path, conversation, **kwargs)
+                return request_json(path, conversation, body, **kwargs)
+            self.request_json = wrapped_request_json
         else:
             self.request_json = self._request_json
         self.stream_open = stream_open or self._stream_open
@@ -140,9 +149,10 @@ class OpenCodeTransport:
         return urllib.request.Request(self._url(path, conversation),
             data=None if body is None else json.dumps(body).encode(), headers=headers, method=method)
 
-    def _request_json(self, path, conversation, body=None, method=None):
+    def _request_json(self, path, conversation, body=None, method=None, timeout=None):
         try:
-            with urllib.request.urlopen(self._request(path, conversation, body, method=method), timeout=self.timeout) as response:
+            req_timeout = self.timeout if timeout is None else timeout
+            with urllib.request.urlopen(self._request(path, conversation, body, method=method), timeout=req_timeout) as response:
                 raw = response.read()
                 return json.loads(raw) if raw else None
         except urllib.error.HTTPError as error:
@@ -355,7 +365,10 @@ class OpenCodeTransport:
                 raise BridgeError(502, "opencode_inference_failed", "OpenCode inference failed: " + str(info["error"].get("name", "unknown error")))
             usage = None
             try:
-                messages = self.request_json(f"/session/{conversation.session_id}/message", conversation)
+                # Telemetry retrieval is optional; bound it to a short timeout (default 5s)
+                # so an upstream delay on GET /session/.../message does not stall response completion.
+                telemetry_timeout = min(self.timeout, float(os.environ.get("OPENCODE_TELEMETRY_TIMEOUT", 5.0)))
+                messages = self.request_json(f"/session/{conversation.session_id}/message", conversation, timeout=telemetry_timeout)
                 usage = usage_from_messages(messages)
             except Exception:
                 pass
