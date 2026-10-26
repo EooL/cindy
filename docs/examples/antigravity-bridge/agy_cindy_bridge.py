@@ -1,0 +1,1251 @@
+#!/usr/bin/env python3
+"""
+Cindy AI <-> Google Antigravity CLI (agy) Native Inherited-Auth Bridge
+Reads the live OAuth credential from Windows Credential Manager ("gemini:antigravity"),
+auto-refreshes via `agy.exe` when needed, fetches live quotas via
+`agy -p /quota --output-format json` (the agy CLI quota command),
+and translates OpenAI Chat Completions (/v1/chat/completions, /v1/models, /v1/quota)
+to Google Cloud Code Assist v1internal.
+"""
+
+import ctypes
+from ctypes import wintypes
+import datetime
+import http.server
+import json
+import os
+import socketserver
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+
+HOST = "127.0.0.1"
+PORT = int(os.environ.get("AGY_BRIDGE_PORT", "11436"))
+UPSTREAM_BASE = "https://daily-cloudcode-pa.googleapis.com"
+AGY_BIN = os.path.expandvars(r"%LOCALAPPDATA%\agy\bin\agy.exe")
+KEYRING_TARGET = "gemini:antigravity"
+USER_AGENT = "antigravity/1.0.0 windows/amd64"
+PAID_TIER_HEADER = "CAE="
+QUOTA_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "quota_cache.json")
+
+AGY_MODELS_CACHE = {"ts": 0.0, "data": []}
+AGY_CACHE_LOCK = threading.Lock()
+
+def fetch_dynamic_agy_models():
+    """Dynamically queries `agy models` to discover active models and reasoning efforts."""
+    try:
+        res = subprocess.run(
+            "agy models",
+            shell=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            timeout=15
+        )
+        if res.returncode == 0 and res.stdout:
+            families = {}
+            for line in res.stdout.splitlines():
+                line = line.strip()
+                if not line or "Fetching" in line:
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 2:
+                    vid, name_full = parts[0].strip(), parts[1].strip()
+                    m = re.match(r"^(.*?)-(low|medium|high|xhigh|max|minimal)$", vid)
+                    if m:
+                        base_id, effort = m.group(1), m.group(2)
+                    else:
+                        base_id, effort = vid, None
+                    clean_name = re.sub(r"\s*\((Low|Medium|High|Max|Minimal)\)\s*$", "", name_full)
+                    if base_id not in families:
+                        ctx = 200000 if "claude" in base_id else 1000000
+                        max_out = 64000 if "claude" in base_id else 65536
+                        families[base_id] = {
+                            "id": base_id,
+                            "name": clean_name,
+                            "backend": vid,
+                            "context_window": ctx,
+                            "max_output": max_out,
+                            "efforts": [],
+                            "default_effort": "high",
+                            "default_enabled": True,
+                            "supports_image": True if "gemini" in base_id or "claude" in base_id else False,
+                            "supports_fast": True if "flash" in base_id or "argon" in base_id or "oss" in base_id else False,
+                            "description": f"Live dynamic Google Antigravity model ({clean_name}).",
+                        }
+                    if effort and effort not in families[base_id]["efforts"]:
+                        families[base_id]["efforts"].append(effort)
+
+            if families:
+                # Merge into list
+                catalog = []
+                for b_id, m in families.items():
+                    if not m["efforts"]:
+                        m["efforts"] = ["low", "medium", "high"]
+                    catalog.append(m)
+                return catalog
+    except Exception as e:
+        print(f"[WARN] Error in fetch_dynamic_agy_models: {e}", file=sys.stderr)
+    return []
+
+def get_dynamic_agy_models(force=False):
+    now = time.time()
+    with AGY_CACHE_LOCK:
+        if not force and AGY_MODELS_CACHE["data"] and (now - AGY_MODELS_CACHE["ts"] < 1800): # 30 min cache
+            return AGY_MODELS_CACHE["data"]
+
+    new_models = fetch_dynamic_agy_models()
+    if new_models:
+        with AGY_CACHE_LOCK:
+            AGY_MODELS_CACHE["data"] = new_models
+            AGY_MODELS_CACHE["ts"] = now
+        return new_models
+
+    return AGY_MODELS_CACHE.get("data") or MODEL_CATALOG
+
+# Baseline model catalog (fallback if agy CLI is currently running a busy turn)
+MODEL_CATALOG = [
+    {
+        "id": "gemini-4-argon",
+        "name": "Gemini 4 Argon",
+        "backend": "gemini-3.8-flash-tiered",
+        "thinking_budget": 24576,
+        "context_window": 1000000,
+        "max_output": 65536,
+        "efforts": ["low", "medium", "high"],
+        "default_effort": "high",
+        "default_enabled": True,
+        "supports_image": True,
+        "supports_fast": True,
+        "description": "Flagship Google Antigravity model for complex coding, research, and agentic reasoning.",
+    },
+    {
+        "id": "gemini-3.8-flash",
+        "name": "Gemini 3.8 Flash",
+        "backend": "gemini-3.8-flash-tiered",
+        "thinking_budget": 16000,
+        "context_window": 1000000,
+        "max_output": 65536,
+        "efforts": ["low", "medium", "high"],
+        "default_effort": "high",
+        "default_enabled": True,
+        "supports_image": True,
+        "supports_fast": True,
+        "description": "High-speed multimodal reasoning model in Google Antigravity.",
+    },
+    {
+        "id": "claude-opus-5-5",
+        "name": "Claude Opus 5.5",
+        "backend": "claude-opus-5-5-high",
+        "thinking_budget": 24576,
+        "context_window": 200000,
+        "max_output": 64000,
+        "efforts": ["low", "medium", "high", "max"],
+        "default_effort": "high",
+        "default_enabled": True,
+        "supports_image": True,
+        "supports_fast": False,
+        "description": "Anthropic Claude Opus 5.5 hosted via Google Antigravity subscription.",
+    },
+    {
+        "id": "claude-sonnet-5-5",
+        "name": "Claude Sonnet 5.5",
+        "backend": "claude-sonnet-5-5-medium",
+        "thinking_budget": 16000,
+        "context_window": 200000,
+        "max_output": 64000,
+        "efforts": ["low", "medium", "high"],
+        "default_effort": "medium",
+        "default_enabled": True,
+        "supports_image": True,
+        "supports_fast": True,
+        "description": "Anthropic Claude Sonnet 5.5 hosted via Google Antigravity subscription.",
+    },
+    {
+        "id": "gemini-2.5-pro",
+        "name": "Gemini 2.5 Pro",
+        "backend": "gemini-2.5-pro",
+        "thinking_budget": 16000,
+        "context_window": 1000000,
+        "max_output": 65536,
+        "efforts": ["low", "medium", "high"],
+        "default_effort": "high",
+        "default_enabled": False,
+        "supports_image": True,
+        "supports_fast": False,
+        "description": "Deep reasoning and long-context coding model.",
+    },
+    {
+        "id": "gemini-3-flash",
+        "name": "Gemini 3 Flash",
+        "backend": "gemini-3-flash",
+        "thinking_budget": 8192,
+        "context_window": 1000000,
+        "max_output": 65536,
+        "efforts": ["low", "medium", "high"],
+        "default_effort": "medium",
+        "default_enabled": False,
+        "supports_image": True,
+        "supports_fast": True,
+        "description": "Balanced speed and intelligence for everyday coding tasks.",
+    },
+    {
+        "id": "gemini-3.5-flash-lite",
+        "name": "Gemini 3.5 Flash Lite",
+        "backend": "gemini-3.5-flash-lite",
+        "thinking_budget": 0,
+        "context_window": 1000000,
+        "max_output": 65536,
+        "efforts": ["low", "medium"],
+        "default_effort": "low",
+        "default_enabled": False,
+        "supports_image": True,
+        "supports_fast": True,
+        "description": "Ultra-fast lightweight model for quick edits and completions.",
+    },
+    {
+        "id": "gemini-2.5-flash",
+        "name": "Gemini 2.5 Flash",
+        "backend": "gemini-2.5-flash",
+        "thinking_budget": 8192,
+        "context_window": 1000000,
+        "max_output": 65536,
+        "efforts": ["low", "medium", "high"],
+        "default_effort": "medium",
+        "default_enabled": False,
+        "supports_image": True,
+        "supports_fast": True,
+        "description": "Fast multimodal Gemini 2.5 model.",
+    },
+    {
+        "id": "gpt-oss-120b",
+        "name": "GPT-OSS 120B",
+        "backend": "gpt-oss-120b-medium",
+        "thinking_budget": 8192,
+        "context_window": 128000,
+        "max_output": 32768,
+        "efforts": ["low", "medium", "high"],
+        "default_effort": "medium",
+        "default_enabled": False,
+        "supports_image": False,
+        "supports_fast": True,
+        "description": "Open-weights 120B model hosted on Google Antigravity.",
+    },
+]
+
+MODEL_MAP = {m["id"]: m for m in MODEL_CATALOG}
+# Backwards-compatible aliases
+MODEL_ALIASES = {
+    "gemini-4-argon-high": ("gemini-4-argon", "high"),
+    "gemini-4-argon-medium": ("gemini-4-argon", "medium"),
+    "gemini-4-argon-low": ("gemini-4-argon", "low"),
+    "gemini-3.8-flash-high": ("gemini-3.8-flash", "high"),
+    "gemini-3.8-flash-medium": ("gemini-3.8-flash", "medium"),
+    "gemini-3.8-flash-low": ("gemini-3.8-flash", "low"),
+    "claude-opus-5-5-high": ("claude-opus-5-5", "high"),
+    "claude-sonnet-5-5-medium": ("claude-sonnet-5-5", "medium"),
+    "gpt-oss-120b-medium": ("gpt-oss-120b", "medium"),
+}
+
+EFFORT_TO_BUDGET = {
+    "minimal": 0,
+    "low": 8192,
+    "medium": 16000,
+    "high": 24576,
+    "xhigh": 32768,
+    "max": 32768,
+    "ultra": 32768,
+}
+
+THOUGHT_SIG_CACHE = {}
+CACHE_LOCK = threading.Lock()
+PROJECT_ID_CACHE = {"project": "aicode-consumers"}
+QUOTA_MEM_CACHE = {"ts": 0.0, "data": None}
+QUOTA_LOCK = threading.Lock()
+
+# Win32 CredReadW setup
+advapi32 = ctypes.WinDLL("Advapi32.dll")
+
+
+class CREDENTIAL(ctypes.Structure):
+    _fields_ = [
+        ("Flags", wintypes.DWORD),
+        ("Type", wintypes.DWORD),
+        ("TargetName", wintypes.LPWSTR),
+        ("Comment", wintypes.LPWSTR),
+        ("LastWritten", wintypes.FILETIME),
+        ("CredentialBlobSize", wintypes.DWORD),
+        ("CredentialBlob", ctypes.POINTER(ctypes.c_ubyte)),
+        ("Persist", wintypes.DWORD),
+        ("AttributeCount", wintypes.DWORD),
+        ("Attributes", ctypes.c_void_p),
+        ("TargetAlias", wintypes.LPWSTR),
+        ("UserName", wintypes.LPWSTR),
+    ]
+
+
+PCREDENTIAL = ctypes.POINTER(CREDENTIAL)
+advapi32.CredReadW.argtypes = [
+    wintypes.LPCWSTR,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    ctypes.POINTER(PCREDENTIAL),
+]
+advapi32.CredReadW.restype = wintypes.BOOL
+advapi32.CredFree.argtypes = [ctypes.c_void_p]
+
+
+def read_keyring_token():
+    pcred = PCREDENTIAL()
+    if not advapi32.CredReadW(KEYRING_TARGET, 1, 0, ctypes.byref(pcred)):
+        return None
+    try:
+        cred = pcred.contents
+        raw = ctypes.string_at(cred.CredentialBlob, cred.CredentialBlobSize)
+        data = json.loads(raw.decode("utf-8"))
+        return data.get("token", {})
+    except Exception:
+        return None
+    finally:
+        advapi32.CredFree(pcred)
+
+
+def refresh_via_agy_cli():
+    if not os.path.exists(AGY_BIN):
+        return False
+    try:
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        subprocess.run(
+            [AGY_BIN, "models"],
+            capture_output=True,
+            timeout=15,
+            startupinfo=startupinfo,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def get_valid_access_token(force_refresh=False):
+    if force_refresh:
+        refresh_via_agy_cli()
+    tok = read_keyring_token()
+    if not tok or not tok.get("access_token"):
+        refresh_via_agy_cli()
+        tok = read_keyring_token()
+    if not tok:
+        raise RuntimeError("No 'gemini:antigravity' credential found in Windows Credential Manager.")
+
+    expiry_str = tok.get("expiry")
+    if expiry_str and not force_refresh:
+        try:
+            exp = datetime.datetime.fromisoformat(expiry_str)
+            now = datetime.datetime.now(exp.tzinfo)
+            if (exp - now).total_seconds() < 180:
+                refresh_via_agy_cli()
+                tok = read_keyring_token() or tok
+        except Exception:
+            pass
+    return tok["access_token"]
+
+
+def parse_iso_to_epoch(iso_str):
+    if not iso_str or not isinstance(iso_str, str):
+        return None
+    try:
+        s = iso_str.replace("Z", "+00:00")
+        return int(datetime.datetime.fromisoformat(s).timestamp())
+    except Exception:
+        return None
+
+
+def format_bucket_title(group_name, bucket_name, bucket_id):
+    if bucket_id == "gemini-5h":
+        return "Gemini · 5 hours"
+    if bucket_id == "gemini-weekly":
+        return "Gemini · Weekly"
+    if "argon" in (bucket_id or ""):
+        return "Gemini 4 Argon · Weekly"
+    if bucket_id == "3p-5h":
+        return "Claude & GPT · 5 hours"
+    if bucket_id == "3p-weekly":
+        return "Claude & GPT · Weekly"
+    if group_name and bucket_name:
+        return f"{group_name} · {bucket_name}"
+    return bucket_name or group_name or bucket_id
+
+
+WINDOW_SORT_ORDER = {
+    "gemini-5h": 0,
+    "gemini-weekly": 1,
+    "gemini-argon-wtu-weekly": 2,
+    "argon-weekly": 2,
+    "3p-5h": 3,
+    "3p-weekly": 4,
+}
+
+
+def refresh_quota_Via_agy_cli():
+    """
+    Runs `agy.exe -p /quota --output-format json` (same as D:\\work\\ai-quota-widget)
+    to retrieve all 3 quota groups (Gemini Models, Claude and GPT models, Gemini 4 Argon)
+    with 5h and weekly reset windows.
+    """
+    now_s = time.time()
+    windows = []
+    notices = []
+    email = os.environ.get("AGY_ACCOUNT_EMAIL", "")
+    plan_label = "Google AI Pro"
+
+    if os.path.exists(AGY_BIN):
+        try:
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            res = subprocess.run(
+                [AGY_BIN, "-p", "/quota", "--output-format", "json"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15,
+                startupinfo=startupinfo,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            if res.returncode == 0 and res.stdout.strip():
+                payload = json.loads(res.stdout.strip())
+                groups = (((payload.get("command") or {}).get("data") or {}).get("groups")) or []
+                for group in groups:
+                    gname = group.get("name") or ""
+                    for bucket in group.get("buckets") or []:
+                        bid = bucket.get("id") or ""
+                        bname = bucket.get("name") or ""
+                        rem = bucket.get("remaining_fraction")
+                        if rem is None:
+                            rem = 0.0
+                        rem_f = max(0.0, min(1.0, float(rem)))
+                        utilization = round((1.0 - rem_f) * 100)
+                        resets_at = parse_iso_to_epoch(bucket.get("reset_time"))
+                        title = format_bucket_title(gname, bname, bid)
+                        windows.append({
+                            "key": bid or f"{gname}-{bname}",
+                            "title": title,
+                            "showRemaining": True,
+                            "window": {
+                                "utilization": utilization,
+                                "resetsAt": resets_at,
+                            },
+                        })
+                        if utilization >= 100:
+                            notices.append({
+                                "tone": "crit",
+                                "text": f"Limit reached: {title} (0% remaining)",
+                            })
+        except Exception:
+            pass
+
+    if not windows:
+        try:
+            tok = get_valid_access_token(force_refresh=False)
+            req = urllib.request.Request(
+                f"{UPSTREAM_BASE}/v1internal:retrieveUserQuotaSummary",
+                data=b"{}",
+                headers={
+                    "Authorization": f"Bearer {tok}",
+                    "Content-Type": "application/json",
+                    "User-Agent": USER_AGENT,
+                    "X-Goog-Ext-525006001-bin": PAID_TIER_HEADER,
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                raw_quotas = json.loads(resp.read().decode("utf-8"))
+            for idx, q in enumerate(raw_quotas.get("quotas") or []):
+                bid = q.get("identifier") or f"quota-{idx}"
+                rem = q.get("remainingFraction")
+                if rem is None:
+                    rem = 0.0
+                rem_f = max(0.0, min(1.0, float(rem)))
+                utilization = round((1.0 - rem_f) * 100)
+                resets_at = parse_iso_to_epoch(q.get("resetTime"))
+                title = format_bucket_title(q.get("groupName"), q.get("limitName"), bid)
+                windows.append({
+                    "key": bid,
+                    "title": title,
+                    "showRemaining": True,
+                    "window": {
+                        "utilization": utilization,
+                        "resetsAt": resets_at,
+                    },
+                })
+                if utilization >= 100:
+                    notices.append({
+                        "tone": "crit",
+                        "text": f"Limit reached: {title} (0% remaining)",
+                    })
+        except Exception:
+            pass
+
+    if windows:
+        windows.sort(key=lambda w: WINDOW_SORT_ORDER.get(w["key"], 99))
+        result = {
+            "title": "Google Antigravity",
+            "identity": email,
+            "planLabel": plan_label,
+            "updatedAt": int(now_s * 1000),
+            "windows": windows,
+            "notices": notices,
+            "details": ["Local Antigravity CLI account · Google AI Pro"],
+        }
+        with QUOTA_LOCK:
+            QUOTA_MEM_CACHE["ts"] = now_s
+            QUOTA_MEM_CACHE["data"] = result
+        try:
+            with open(QUOTA_CACHE_FILE, "w", encoding="utf-8") as cf:
+                json.dump(result, cf, indent=2)
+        except Exception:
+            pass
+        return result
+
+    with QUOTA_LOCK:
+        if QUOTA_MEM_CACHE["data"]:
+            return QUOTA_MEM_CACHE["data"]
+
+    if os.path.exists(QUOTA_CACHE_FILE):
+        try:
+            with open(QUOTA_CACHE_FILE, "r", encoding="utf-8") as cf:
+                cached = json.load(cf)
+                with QUOTA_LOCK:
+                    QUOTA_MEM_CACHE["data"] = cached
+                return cached
+        except Exception:
+            pass
+
+    return {
+        "title": "Google Antigravity",
+        "identity": email,
+        "planLabel": plan_label,
+        "updatedAt": int(now_s * 1000),
+        "windows": [],
+    }
+
+
+def fetch_antigravity_quota(force=False):
+    now_s = time.time()
+    with QUOTA_LOCK:
+        cached = QUOTA_MEM_CACHE["data"]
+        ts = QUOTA_MEM_CACHE["ts"]
+    if not force and cached and (now_s - ts) < 60:
+        return cached
+    if not force and cached:
+        threading.Thread(target=refresh_quota_Via_agy_cli, daemon=True).start()
+        return cached
+    return refresh_quota_Via_agy_cli()
+
+
+def quota_poller_loop():
+    if os.path.exists(QUOTA_CACHE_FILE):
+        try:
+            with open(QUOTA_CACHE_FILE, "r", encoding="utf-8") as cf:
+                cached = json.load(cf)
+                with QUOTA_LOCK:
+                    QUOTA_MEM_CACHE["data"] = cached
+                    QUOTA_MEM_CACHE["ts"] = time.time() - 30
+        except Exception:
+            pass
+    while True:
+        try:
+            refresh_quota_Via_agy_cli()
+        except Exception:
+            pass
+        time.sleep(60)
+
+
+UNSUPPORTED_SCHEMA_KEYS = {
+    "$schema",
+    "$id",
+    "$ref",
+    "$defs",
+    "definitions",
+    "additionalProperties",
+    "patternProperties",
+    "unevaluatedProperties",
+    "propertyNames",
+    "dependentRequired",
+    "dependentSchemas",
+    "dependencies",
+    "default",
+    "examples",
+    "readOnly",
+    "writeOnly",
+    "deprecated",
+    "contentEncoding",
+    "contentMediaType",
+    "if",
+    "then",
+    "else",
+    "allOf",
+    "oneOf",
+    "not",
+    "strict",
+}
+
+
+GEMINI_SCHEMA_PASSTHROUGH_KEYS = {
+    "format", "title", "description", "nullable", "required",
+    "minItems", "maxItems", "minProperties", "maxProperties",
+    "minLength", "maxLength", "pattern", "minimum", "maximum",
+    "example", "propertyOrdering",
+}
+
+
+def sanitize_schema(node):
+    if not isinstance(node, dict):
+        return {"type": "OBJECT"}
+    out = {}
+    if "anyOf" in node and isinstance(node["anyOf"], list):
+        non_null = [
+            b for b in node["anyOf"]
+            if not (isinstance(b, dict) and (b.get("type") == "null" or b.get("enum") == [None]))
+        ]
+        has_null = len(non_null) != len(node["anyOf"])
+        if len(non_null) == 1 and isinstance(non_null[0], dict):
+            merged = dict(non_null[0])
+            if "description" in node and "description" not in merged:
+                merged["description"] = node["description"]
+            res = sanitize_schema(merged)
+            if has_null:
+                res["nullable"] = True
+            return res
+
+    for k, v in node.items():
+        if k in UNSUPPORTED_SCHEMA_KEYS or k == "anyOf":
+            continue
+        if k == "const":
+            out["enum"] = [str(v)]
+            out["type"] = "STRING"
+            continue
+        if k == "type":
+            if isinstance(v, list):
+                non_null_t = [t for t in v if t != "null"]
+                if "null" in v:
+                    out["nullable"] = True
+                out["type"] = (non_null_t[0] if non_null_t else "string").upper()
+            elif isinstance(v, str):
+                if v == "null":
+                    out["type"] = "STRING"
+                    out["nullable"] = True
+                else:
+                    out["type"] = v.upper()
+            continue
+        if k == "properties" and isinstance(v, dict):
+            props = {}
+            for pk, pv in v.items():
+                if isinstance(pv, dict):
+                    props[pk] = sanitize_schema(pv)
+            out["properties"] = props
+            continue
+        if k == "items":
+            if isinstance(v, dict):
+                out["items"] = sanitize_schema(v)
+            elif isinstance(v, list) and v and isinstance(v[0], dict):
+                out["items"] = sanitize_schema(v[0])
+            continue
+        if k == "enum" and isinstance(v, list):
+            vals = [str(x) for x in v if x is not None]
+            if vals:
+                out["enum"] = vals
+                out["type"] = "STRING"
+            continue
+        # Gemini rejects any field outside its Schema message (e.g. "encrypted").
+        if k in GEMINI_SCHEMA_PASSTHROUGH_KEYS:
+            out[k] = v
+
+    if "properties" in out and "type" not in out:
+        out["type"] = "OBJECT"
+    if "required" in out and isinstance(out["required"], list):
+        props = out.get("properties", {})
+        req = [r for r in out["required"] if isinstance(r, str) and r in props]
+        if req:
+            out["required"] = req
+        else:
+            out.pop("required", None)
+    if "type" not in out:
+        out["type"] = "STRING"
+    return out
+
+
+def extract_text_from_content(content):
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                t = item.get("type")
+                if t in ("text", "input_text", "output_text"):
+                    parts.append(item.get("text", ""))
+        return "\n".join(p for p in parts if p)
+    return str(content)
+
+
+def build_cca_request(openai_req):
+    raw_model = openai_req.get("model") or "gemini-4-argon"
+    if "/" in raw_model:
+        raw_model = raw_model.split("/", 1)[1]
+
+    alias_effort = None
+    lookup_model = raw_model
+    if raw_model in MODEL_ALIASES:
+        lookup_model, alias_effort = MODEL_ALIASES[raw_model]
+
+    model_info = MODEL_MAP.get(lookup_model, {
+        "id": raw_model,
+        "backend": "gemini-3.8-flash-tiered" if "argon" in raw_model or "3.8" in raw_model else raw_model,
+        "thinking_budget": 16000 if ("argon" in raw_model or "3.8" in raw_model) else 0,
+    })
+    backend_model = model_info["backend"]
+
+    req_effort = (
+        openai_req.get("reasoning_effort")
+        or (openai_req.get("reasoning") or {}).get("effort")
+        or alias_effort
+        or model_info.get("default_effort")
+    )
+
+    messages = openai_req.get("messages") or []
+    system_texts = []
+    contents = []
+    tool_id_to_name = {}
+
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content")
+
+        if role in ("system", "developer"):
+            txt = extract_text_from_content(content)
+            if txt:
+                system_texts.append(txt)
+            continue
+
+        if role == "user":
+            user_parts = []
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict):
+                        itype = item.get("type")
+                        if itype in ("text", "input_text"):
+                            txt = item.get("text", "")
+                            if txt:
+                                user_parts.append({"text": txt})
+                        elif itype == "image_url":
+                            url_obj = item.get("image_url", {})
+                            url_str = url_obj.get("url", "") if isinstance(url_obj, dict) else str(url_obj)
+                            if url_str.startswith("data:") and ";base64," in url_str:
+                                header, b64 = url_str.split(";base64,", 1)
+                                mime = header.replace("data:", "") or "image/png"
+                                user_parts.append({"inlineData": {"mimeType": mime, "data": b64}})
+            else:
+                txt = extract_text_from_content(content)
+                if txt:
+                    user_parts.append({"text": txt})
+            if not user_parts:
+                user_parts.append({"text": " "})
+            if contents and contents[-1]["role"] == "user":
+                contents[-1]["parts"].extend(user_parts)
+            else:
+                contents.append({"role": "user", "parts": user_parts})
+
+        elif role == "assistant":
+            model_parts = []
+            txt = extract_text_from_content(content)
+            if txt:
+                model_parts.append({"text": txt})
+
+            tool_calls = msg.get("tool_calls") or []
+            for tc in tool_calls:
+                tc_id = tc.get("id") or f"call_{uuid.uuid4().hex[:8]}"
+                fn = tc.get("function") or {}
+                fn_name = fn.get("name") or "tool"
+                tool_id_to_name[tc_id] = fn_name
+                raw_args = fn.get("arguments") or "{}"
+                try:
+                    args_obj = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                    if not isinstance(args_obj, dict):
+                        args_obj = {"value": args_obj}
+                except Exception:
+                    args_obj = {"raw": str(raw_args)}
+
+                with CACHE_LOCK:
+                    sig = THOUGHT_SIG_CACHE.get(tc_id, "skip_thought_signature_validator")
+
+                fc_part = {
+                    "thoughtSignature": sig,
+                    "functionCall": {
+                        "name": fn_name,
+                        "args": args_obj,
+                        "id": tc_id,
+                    },
+                }
+                model_parts.append(fc_part)
+
+            if model_parts:
+                if contents and contents[-1]["role"] == "model":
+                    contents[-1]["parts"].extend(model_parts)
+                else:
+                    contents.append({"role": "model", "parts": model_parts})
+
+        elif role == "tool":
+            tc_id = msg.get("tool_call_id") or ""
+            fn_name = msg.get("name") or tool_id_to_name.get(tc_id) or "tool"
+            txt = extract_text_from_content(content)
+            try:
+                resp_obj = json.loads(txt)
+                if not isinstance(resp_obj, dict):
+                    resp_obj = {"output": resp_obj}
+            except Exception:
+                resp_obj = {"output": txt}
+
+            fr_part = {
+                "functionResponse": {
+                    "name": fn_name,
+                    "id": tc_id,
+                    "response": resp_obj,
+                }
+            }
+            if contents and contents[-1]["role"] == "user":
+                contents[-1]["parts"].append(fr_part)
+            else:
+                contents.append({"role": "user", "parts": [fr_part]})
+
+    if not contents:
+        contents.append({"role": "user", "parts": [{"text": "Hello"}]})
+
+    req_inner = {"contents": contents}
+    if system_texts:
+        req_inner["systemInstruction"] = {
+            "role": "user",
+            "parts": [{"text": "\n\n".join(system_texts)}],
+        }
+
+    openai_tools = openai_req.get("tools") or []
+    fn_decls = []
+    for t in openai_tools:
+        if isinstance(t, dict) and t.get("type") == "function":
+            fn = t.get("function") or {}
+            name = fn.get("name")
+            if name:
+                decl = {
+                    "name": name,
+                    "description": fn.get("description") or "",
+                }
+                params = fn.get("parameters")
+                if isinstance(params, dict):
+                    decl["parameters"] = sanitize_schema(params)
+                else:
+                    decl["parameters"] = {"type": "OBJECT", "properties": {}}
+                fn_decls.append(decl)
+    if fn_decls:
+        req_inner["tools"] = [{"functionDeclarations": fn_decls}]
+
+    gen_cfg = {}
+    if "temperature" in openai_req and openai_req["temperature"] is not None:
+        gen_cfg["temperature"] = float(openai_req["temperature"])
+    max_tok = openai_req.get("max_completion_tokens") or openai_req.get("max_tokens")
+    if max_tok and int(max_tok) > 0:
+        gen_cfg["maxOutputTokens"] = min(int(max_tok), 65536)
+
+    if gen_cfg:
+        req_inner["generationConfig"] = gen_cfg
+
+    envelope = {
+        "project": PROJECT_ID_CACHE["project"],
+        "requestId": str(uuid.uuid4()),
+        "model": backend_model,
+        "userAgent": "antigravity",
+        "request": req_inner,
+    }
+    return envelope, raw_model, backend_model
+
+
+def open_upstream_stream(envelope):
+    url = f"{UPSTREAM_BASE}/v1internal:streamGenerateContent?alt=sse"
+    token = get_valid_access_token(force_refresh=False)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+        "X-Goog-Ext-525006001-bin": PAID_TIER_HEADER,
+    }
+    data = json.dumps(envelope).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        return urllib.request.urlopen(req, timeout=120)
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            token = get_valid_access_token(force_refresh=True)
+            headers["Authorization"] = f"Bearer {token}"
+            req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+            return urllib.request.urlopen(req, timeout=120)
+        elif e.code == 429 and envelope.get("model") != "gemini-3.8-flash-tiered":
+            envelope["model"] = "gemini-3.8-flash-tiered"
+            envelope["requestId"] = str(uuid.uuid4())
+            data = json.dumps(envelope).encode("utf-8")
+            req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+            return urllib.request.urlopen(req, timeout=120)
+        raise
+
+
+class BridgeHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        try:
+            log_path = os.path.join(os.path.dirname(__file__), "bridge.log")
+            with open(log_path, "a", encoding="utf-8") as lf:
+                lf.write(f"[{datetime.datetime.now().isoformat()}] {fmt % args}\n")
+        except Exception:
+            pass
+
+    def _send_json(self, status, obj):
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        if path in ("/health", "/v1/health"):
+            tok = read_keyring_token()
+            self._send_json(200, {
+                "status": "ok",
+                "provider": "google-antigravity",
+                "authenticated": bool(tok and tok.get("access_token")),
+                "project": PROJECT_ID_CACHE["project"],
+            })
+            return
+
+        if path in ("/v1/quota", "/quota"):
+            try:
+                quota_obj = fetch_antigravity_quota()
+                self._send_json(200, quota_obj)
+            except Exception as e:
+                self._send_json(500, {"error": {"message": str(e)}})
+            return
+
+        if path in ("/v1/models", "/models"):
+            now = int(time.time())
+            dynamic_catalog = get_dynamic_agy_models()
+            data = []
+            for m in dynamic_catalog:
+                modalities = {
+                    "input": ["text", "image"] if m.get("supports_image") else ["text"],
+                    "output": ["text"],
+                }
+                meta = {
+                    "name": m["name"],
+                    "description": m.get("description", ""),
+                    "contextWindow": m["context_window"],
+                    "contextWindowMax": m["context_window"],
+                    "maxOutputTokens": m["max_output"],
+                    "efforts": m.get("efforts", ["low", "medium", "high"]),
+                    "defaultEffort": m.get("default_effort", "high"),
+                    "supportsImageInput": bool(m.get("supports_image", True)),
+                    "supportsFastMode": bool(m.get("supports_fast", True)),
+                    "supportsToolCalls": True,
+                    "modalities": modalities,
+                }
+                data.append({
+                    "id": m["id"],
+                    "object": "model",
+                    "created": now,
+                    "owned_by": "google-antigravity",
+                    "name": m["name"],
+                    "context_window": m["context_window"],
+                    "max_tokens": m["max_output"],
+                    **meta,
+                    "discoveredMetadata": meta,
+                })
+            self._send_json(200, {"object": "list", "data": data})
+            return
+
+        self._send_json(404, {"error": {"message": f"Not found: {path}"}})
+
+    def do_POST(self):
+        path = self.path.split("?", 1)[0]
+        if path not in ("/v1/chat/completions", "/chat/completions"):
+            self._send_json(404, {"error": {"message": f"Not found: {path}"}})
+            return
+
+        length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(length) if length > 0 else b"{}"
+        try:
+            openai_req = json.loads(raw_body.decode("utf-8"))
+        except Exception as e:
+            self._send_json(400, {"error": {"message": f"Invalid JSON: {e}"}})
+            return
+
+        stream = bool(openai_req.get("stream", False))
+        try:
+            envelope, requested_model, _ = build_cca_request(openai_req)
+            resp = open_upstream_stream(envelope)
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="ignore")
+            self._send_json(e.code, {
+                "error": {
+                    "message": f"Antigravity upstream HTTP {e.code}: {err_body}",
+                    "type": "upstream_error",
+                    "code": e.code,
+                }
+            })
+            return
+        except Exception as e:
+            self._send_json(500, {
+                "error": {
+                    "message": f"Antigravity bridge error: {e}",
+                    "type": "bridge_error",
+                }
+            })
+            return
+
+        chat_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        created = int(time.time())
+
+        if stream:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+
+            def send_sse(obj):
+                line = f"data: {json.dumps(obj)}\n\n".encode("utf-8")
+                self.wfile.write(line)
+                self.wfile.flush()
+
+            send_sse({
+                "id": chat_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": requested_model,
+                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+            })
+
+            tool_call_idx = 0
+            saw_tool_calls = False
+            usage_meta = {}
+
+            try:
+                for raw_line in resp:
+                    line_str = raw_line.decode("utf-8", errors="ignore").strip()
+                    if not line_str.startswith("data:"):
+                        continue
+                    payload_str = line_str[5:].strip()
+                    if not payload_str or payload_str == "[DONE]":
+                        continue
+                    try:
+                        event = json.loads(payload_str)
+                    except Exception:
+                        continue
+
+                    inner = event.get("response") or event
+                    if "usageMetadata" in inner:
+                        usage_meta = inner["usageMetadata"]
+
+                    candidates = inner.get("candidates") or []
+                    for cand in candidates:
+                        parts = (cand.get("content") or {}).get("parts") or []
+                        for part in parts:
+                            sig = part.get("thoughtSignature")
+                            if part.get("thought") is True and part.get("text"):
+                                send_sse({
+                                    "id": chat_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": requested_model,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {"reasoning_content": part["text"]},
+                                        "finish_reason": None,
+                                    }],
+                                })
+                            elif "functionCall" in part:
+                                fc = part["functionCall"]
+                                tc_id = fc.get("id") or f"call_{uuid.uuid4().hex[:12]}"
+                                if sig:
+                                    with CACHE_LOCK:
+                                        THOUGHT_SIG_CACHE[tc_id] = sig
+                                saw_tool_calls = True
+                                send_sse({
+                                    "id": chat_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": requested_model,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {
+                                            "tool_calls": [{
+                                                "index": tool_call_idx,
+                                                "id": tc_id,
+                                                "type": "function",
+                                                "function": {
+                                                    "name": fc.get("name", ""),
+                                                    "arguments": json.dumps(fc.get("args") or {}),
+                                                },
+                                            }]
+                                        },
+                                        "finish_reason": None,
+                                    }],
+                                })
+                                tool_call_idx += 1
+                            elif "text" in part and part["text"]:
+                                send_sse({
+                                    "id": chat_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": requested_model,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {"content": part["text"]},
+                                        "finish_reason": None,
+                                    }],
+                                })
+            finally:
+                resp.close()
+
+            finish_reason = "tool_calls" if saw_tool_calls else "stop"
+            prompt_toks = usage_meta.get("promptTokenCount", 0)
+            cand_toks = usage_meta.get("candidatesTokenCount", 0)
+            total_toks = usage_meta.get("totalTokenCount", prompt_toks + cand_toks)
+
+            send_sse({
+                "id": chat_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": requested_model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+                "usage": {
+                    "prompt_tokens": prompt_toks,
+                    "completion_tokens": cand_toks,
+                    "total_tokens": total_toks,
+                },
+            })
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+            self.close_connection = True
+        else:
+            full_text = []
+            reasoning_text = []
+            tool_calls = []
+            usage_meta = {}
+            try:
+                for raw_line in resp:
+                    line_str = raw_line.decode("utf-8", errors="ignore").strip()
+                    if not line_str.startswith("data:"):
+                        continue
+                    payload_str = line_str[5:].strip()
+                    if not payload_str or payload_str == "[DONE]":
+                        continue
+                    try:
+                        event = json.loads(payload_str)
+                    except Exception:
+                        continue
+                    inner = event.get("response") or event
+                    if "usageMetadata" in inner:
+                        usage_meta = inner["usageMetadata"]
+                    for cand in inner.get("candidates") or []:
+                        for part in (cand.get("content") or {}).get("parts") or []:
+                            sig = part.get("thoughtSignature")
+                            if part.get("thought") is True and part.get("text"):
+                                reasoning_text.append(part["text"])
+                            elif "functionCall" in part:
+                                fc = part["functionCall"]
+                                tc_id = fc.get("id") or f"call_{uuid.uuid4().hex[:12]}"
+                                if sig:
+                                    with CACHE_LOCK:
+                                        THOUGHT_SIG_CACHE[tc_id] = sig
+                                tool_calls.append({
+                                    "id": tc_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": fc.get("name", ""),
+                                        "arguments": json.dumps(fc.get("args") or {}),
+                                    },
+                                })
+                            elif "text" in part and part["text"]:
+                                full_text.append(part["text"])
+            finally:
+                resp.close()
+
+            msg_obj = {
+                "role": "assistant",
+                "content": "".join(full_text) if full_text or not tool_calls else None,
+            }
+            if reasoning_text:
+                msg_obj["reasoning_content"] = "".join(reasoning_text)
+            if tool_calls:
+                msg_obj["tool_calls"] = tool_calls
+
+            prompt_toks = usage_meta.get("promptTokenCount", 0)
+            cand_toks = usage_meta.get("candidatesTokenCount", 0)
+            total_toks = usage_meta.get("totalTokenCount", prompt_toks + cand_toks)
+
+            self._send_json(200, {
+                "id": chat_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": requested_model,
+                "choices": [{
+                    "index": 0,
+                    "message": msg_obj,
+                    "finish_reason": "tool_calls" if tool_calls else "stop",
+                }],
+                "usage": {
+                    "prompt_tokens": prompt_toks,
+                    "completion_tokens": cand_toks,
+                    "total_tokens": total_toks,
+                },
+            })
+
+
+class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def main():
+    threading.Thread(target=quota_poller_loop, daemon=True).start()
+    server = ThreadedHTTPServer((HOST, PORT), BridgeHandler)
+    try:
+        log_path = os.path.join(os.path.dirname(__file__), "bridge.log")
+        with open(log_path, "a", encoding="utf-8") as lf:
+            lf.write(f"[{datetime.datetime.now().isoformat()}] Listening on http://{HOST}:{PORT}/v1\n")
+    except Exception:
+        pass
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
