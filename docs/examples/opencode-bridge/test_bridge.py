@@ -188,6 +188,18 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 'tool_choice_not_honored')
         self.assertEqual(conversation.pending, {})
 
+    def test_capacity_rejection_leaves_no_temp_directories(self):
+        transport = OpenCodeTransport('http://unused', request_json=lambda *args: None)
+        for i in range(32):
+            transport.conversations[f'slot_{i}'] = Conversation(f'slot_{i}', f'/tmp/{i}', 'model', {}, 'auto')
+        before = set(pathlib.Path(tempfile.gettempdir()).glob('cindy-opencode-*'))
+        with self.assertRaises(BridgeError) as raised:
+            transport._new({'model': 'fixture', 'messages': [{'role': 'user', 'content': 'hi'}]}, [])
+        self.assertEqual(raised.exception.status, 429)
+        self.assertEqual(raised.exception.code, 'bridge_busy')
+        after = set(pathlib.Path(tempfile.gettempdir()).glob('cindy-opencode-*'))
+        self.assertEqual(after - before, set())
+
 
 if __name__ == '__main__':
     unittest.main()

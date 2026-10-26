@@ -12,6 +12,7 @@ import mimetypes
 import os
 from pathlib import Path
 import queue
+import shutil
 import tempfile
 import threading
 import time
@@ -204,11 +205,18 @@ class OpenCodeTransport:
 
     def _new(self, request, models):
         tools, choice = self._definitions(request)
+        with self.lock:
+            if len(self.conversations) >= 32:
+                raise BridgeError(429, "bridge_busy", "Too many active bridge conversations.")
         token = uuid.uuid4().hex
         directory = tempfile.mkdtemp(prefix="cindy-opencode-")
         conversation = Conversation(token, directory, request["model"], tools, choice)
         with self.lock:
             if len(self.conversations) >= 32:
+                try:
+                    shutil.rmtree(directory, ignore_errors=True)
+                except OSError:
+                    pass
                 raise BridgeError(429, "bridge_busy", "Too many active bridge conversations.")
             self.conversations[token] = conversation
         try:
