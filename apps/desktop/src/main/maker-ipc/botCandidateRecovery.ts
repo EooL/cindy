@@ -8,8 +8,16 @@ import type { InterruptedTurnErrorSignals } from './interruptedTurnAutoResume.js
  * authoritative; the shared deterministic text is the fallback for untagged envelopes.
  */
 export function isAccountUsageExhausted(signals: InterruptedTurnErrorSignals): boolean {
-  return signals.codexErrorInfo === 'usageLimitExceeded' || signals.sdkError === 'billing_error'
-    || matchesDeterministicUsageExhaustionText(signals.message ?? '');
+  if (signals.codexErrorInfo === 'usageLimitExceeded' || signals.sdkError === 'billing_error') return true;
+  // 402 Payment Required is account-level for every provider.
+  if (signals.errorStatus === 402) return true;
+  // Claude subscription limits carry a structured reset time from the SDK rate_limit_event.
+  if (signals.sdkError === 'rate_limit' && typeof signals.usageResetAt === 'number') return true;
+  const message = signals.message ?? '';
+  // Untagged Claude session-limit envelopes; a known SDK tag must not be reclassified from text.
+  const untagged = !signals.sdkError || signals.sdkError === 'unknown';
+  return matchesDeterministicUsageExhaustionText(message)
+    || (untagged && /\byou['’]ve hit your session limit\b/i.test(message));
 }
 
 type AccountRoute = { harness: string; providerId?: string | null; agentDeviceId?: string | null };

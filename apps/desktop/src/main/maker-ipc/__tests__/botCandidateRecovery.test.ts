@@ -66,7 +66,7 @@ describe('Bot candidate recovery', () => {
     expect(h.isResumableTurnErrorCandidate(signals, h.item)).toBe(true);
     expect(h.onResumableTurnError('s', signals, h.item)).not.toBeNull();
     await h.run();
-    expect(h.fallback).toHaveBeenCalledWith('s', 1, 1, true, expect.any(Function), false);
+    expect(h.fallback).toHaveBeenCalledWith('s', 1, 1, true, expect.any(Function), true);
     expect(h.resume).toHaveBeenCalledOnce();
   });
 
@@ -132,6 +132,9 @@ describe('Bot candidate recovery', () => {
     { errorStatus: 429, message: 'You exceeded your current quota, please check your plan and billing details.' },
     { message: 'insufficient_quota' },
     { message: "You've hit your session limit: budget_exceeded" },
+    { message: "You've hit your session limit · resets 9:30pm (Asia/Shanghai)" },
+    { sdkError: 'rate_limit', usageResetAt: 1_800_000_000_000, message: 'SDK error: rate_limit' },
+    { errorStatus: 402, message: 'Payment Required' },
   ])('switches only to another account on account exhaustion %j', (signals) => {
     expect(isBotCandidateUnavailable(signals)).toBe(true);
     expect(isAccountUsageExhausted(signals)).toBe(true);
