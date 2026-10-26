@@ -44,6 +44,7 @@ MODELS_CACHE = {"ts": 0.0, "data": []}
 CACHE_LOCK = threading.Lock()
 DISCOVERY_LOCK = threading.Lock()
 DISCOVERY_TIMEOUT = int(os.environ.get("OPENCODE_DISCOVERY_TIMEOUT", "8"))
+MAX_BODY_BYTES = int(os.environ.get("OPENCODE_BRIDGE_MAX_BODY_BYTES", str(64 * 1024 * 1024)))
 
 def load_opencode_config():
     try:
@@ -371,8 +372,10 @@ class OpenCodeBridgeHandler(http.server.BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            if length <= 0 or length > 16 * 1024 * 1024:
-                raise BridgeError(400, "invalid_request", "Expected a JSON body up to 16 MiB.")
+            if length <= 0:
+                raise BridgeError(400, "invalid_request", "Expected a non-empty JSON body.")
+            if length > MAX_BODY_BYTES:
+                raise BridgeError(413, "payload_too_large", f"Request payload exceeds {MAX_BODY_BYTES // (1024 * 1024)} MiB limit.")
             req = json.loads(self.rfile.read(length))
             if not isinstance(req, dict):
                 raise BridgeError(400, "invalid_request", "Expected a JSON object.")
@@ -389,9 +392,9 @@ class OpenCodeBridgeHandler(http.server.BaseHTTPRequestHandler):
                 raise BridgeError(404, "not_found", "Unknown endpoint.")
             TRANSPORT.chat(req, self, get_cached_models())
         except (ValueError, UnicodeDecodeError):
-            self._send_json(400, {"error": {"type": "invalid_request", "message": "Invalid JSON request."}})
+            self._send_json(400, {"error": {"type": "invalid_request", "code": "invalid_request", "message": "Invalid JSON request."}})
         except BridgeError as error:
-            self._send_json(error.status, {"error": {"type": error.code, "message": str(error)}})
+            self._send_json(error.status, {"error": {"type": error.code, "code": error.code, "message": str(error)}})
         except (BrokenPipeError, ConnectionResetError):
             self.close_connection = True
 

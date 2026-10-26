@@ -393,6 +393,22 @@ class BridgeTests(unittest.TestCase):
             self.assertEqual(raised.exception.status, 502)
             self.assertEqual(raised.exception.code, "opencode_unavailable")
 
+    def test_post_payload_size_boundaries(self):
+        handler = Handler()
+        handler.path = "/v1/chat/completions"
+        handler.rfile = io.BytesIO(b"{}")
+        # Oversized payload returns HTTP 413
+        handler.headers = {"Content-Length": str(100 * 1024 * 1024)}
+        bridge.OpenCodeBridgeHandler.do_POST(handler)
+        self.assertEqual(handler.status, 413)
+        self.assertEqual(handler.json["error"]["code"], "payload_too_large")
+
+        # Zero length returns HTTP 400
+        handler.headers = {"Content-Length": "0"}
+        bridge.OpenCodeBridgeHandler.do_POST(handler)
+        self.assertEqual(handler.status, 400)
+        self.assertEqual(handler.json["error"]["code"], "invalid_request")
+
 
 if __name__ == '__main__':
     unittest.main()
