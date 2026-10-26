@@ -14,6 +14,8 @@ from contextlib import closing
 import tempfile
 import threading
 import unittest
+import urllib.error
+import urllib.request
 from unittest.mock import patch
 
 import opencode_cindy_bridge as bridge
@@ -375,6 +377,21 @@ class BridgeTests(unittest.TestCase):
             transport.conversations["tok_2"] = Conversation("tok_2", "/tmp/2", "model", {}, "auto")
             transport.shutdown()
             self.assertEqual(set(closed), {"tok_1", "tok_2"})
+
+    def test_stream_open_normalizes_connection_failures(self):
+        transport = OpenCodeTransport("http://127.0.0.1:9999")
+        conv = Conversation("tok_stream", "/tmp", "model", {}, "auto")
+        with patch("urllib.request.urlopen", side_effect=urllib.error.HTTPError("http://127.0.0.1:9999/event", 503, "Service Unavailable", {}, None)):
+            with self.assertRaises(BridgeError) as raised:
+                transport._stream_open(conv)
+            self.assertEqual(raised.exception.status, 502)
+            self.assertEqual(raised.exception.code, "opencode_http_error")
+
+        with patch("urllib.request.urlopen", side_effect=OSError("Connection refused")):
+            with self.assertRaises(BridgeError) as raised:
+                transport._stream_open(conv)
+            self.assertEqual(raised.exception.status, 502)
+            self.assertEqual(raised.exception.code, "opencode_unavailable")
 
 
 if __name__ == '__main__':

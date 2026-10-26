@@ -153,7 +153,13 @@ class OpenCodeTransport:
             raise BridgeError(502, "opencode_unavailable", "OpenCode could not complete the request.") from error
 
     def _stream_open(self, conversation):
-        return urllib.request.urlopen(self._request("/event", conversation), timeout=self.timeout)
+        try:
+            return urllib.request.urlopen(self._request("/event", conversation), timeout=self.timeout)
+        except urllib.error.HTTPError as error:
+            status = error.code if 400 <= error.code < 500 else 502
+            raise BridgeError(status, "opencode_http_error", f"OpenCode event stream rejected the request (HTTP {error.code}).") from None
+        except (OSError, ValueError) as error:
+            raise BridgeError(502, "opencode_unavailable", "OpenCode event stream could not complete the request.") from error
 
     def _reap(self):
         now = time.monotonic()
