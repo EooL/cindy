@@ -31,10 +31,28 @@ def environment(state):
     return env
 
 
-def main():
-    state = Path(os.environ.get("OPENCODE_BRIDGE_STATE", str(
-        Path(tempfile.gettempdir()) / "cindy-opencode-server"))).resolve()
+def state_directory():
+    custom = os.environ.get("OPENCODE_BRIDGE_STATE")
+    if custom:
+        path = Path(custom).resolve()
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData/Local"))) / "CindyGlobal"
+    else:
+        base = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "cindy"
+    state = (base / "opencode-server").resolve()
     state.mkdir(parents=True, exist_ok=True)
+    if hasattr(os, "chmod"):
+        try:
+            os.chmod(state, 0o700)
+        except OSError:
+            pass
+    return state
+
+
+def main():
+    state = state_directory()
     env = environment(state)
     server_port = int(env.get("OPENCODE_SERVER_PORT", "14782"))
     bridge_port = int(env.get("OPENCODE_BRIDGE_PORT", "11437"))

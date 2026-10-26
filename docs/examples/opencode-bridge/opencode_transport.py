@@ -223,8 +223,7 @@ class OpenCodeTransport:
             # Cindy's harness owns context management. Native OpenCode compaction can
             # otherwise loop forever for a small local model before returning a reply.
             config = {"compaction": {"auto": False}, "agent": {"cindy-bridge": {
-                "description": "Model transport for Cindy", "mode": "primary",
-                "prompt": "Follow the supplied system instructions and conversation history. Use only the tools supplied by Cindy when needed."}}}
+                "description": "Model transport for Cindy", "mode": "primary"}}}
             Path(directory, "opencode.json").write_text(json.dumps(config), encoding="utf-8")
             # Each request owns an OpenCode instance, MCP namespace, and permission rules.
             # Discover built-in and configured MCP tools, then disable all of them.
@@ -258,8 +257,6 @@ class OpenCodeTransport:
             # System instructions stay in OpenCode's system field, never in a user role.
             system = "\n\n".join(m["content"] for m in request["messages"]
                                   if m.get("role") in ("system", "developer") and isinstance(m.get("content"), str))
-            if choice == "required" or isinstance(choice, dict):
-                system += "\nYou must call one of the supplied Cindy tools before answering."
             history = [m for m in request["messages"] if m.get("role") not in ("system", "developer")]
             payload = {"model": {"providerID": provider, "modelID": model}, "agent": "cindy-bridge", "tools": tool_flags,
                        "system": system, "parts": [{"type": "text", "text": json.dumps({"conversation": history}, ensure_ascii=False)}]}
