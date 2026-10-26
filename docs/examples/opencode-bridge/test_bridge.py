@@ -461,6 +461,48 @@ class BridgeTests(unittest.TestCase):
         finally:
             transport._close(conv, abort=False)
 
+    def test_max_tokens_and_max_completion_tokens_mapped_to_opencode_config(self):
+        transport = OpenCodeTransport("http://127.0.0.1:9999", request_json=lambda *a, **kw: {"id": "ses_1"}, stream_open=lambda conv: io.BytesIO(b""))
+        transport.callback_base = "http://127.0.0.1:9999"
+
+        # 1. Using max_tokens
+        conv = transport._new(
+            {"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 128},
+            [{"id": "test-model", "provider": "opencode", "context_window": 64000}],
+        )
+        try:
+            cfg = json.loads(pathlib.Path(conv.directory, "opencode.json").read_text(encoding="utf-8"))
+            self.assertEqual(conv.max_tokens, 128)
+            self.assertEqual(cfg["agent"]["cindy-bridge"]["options"]["maxTokens"], 128)
+            self.assertEqual(cfg["provider"]["opencode"]["models"]["test-model"]["limit"]["output"], 128)
+            self.assertEqual(cfg["provider"]["opencode"]["models"]["test-model"]["limit"]["context"], 64000)
+        finally:
+            transport._close(conv, abort=False)
+
+        # 2. Using max_completion_tokens
+        conv2 = transport._new(
+            {"model": "custom_provider/custom_model", "messages": [{"role": "user", "content": "hi"}], "max_completion_tokens": 256},
+            [{"id": "custom_provider/custom_model", "provider": "custom_provider", "context_window": 32000}],
+        )
+        try:
+            cfg2 = json.loads(pathlib.Path(conv2.directory, "opencode.json").read_text(encoding="utf-8"))
+            self.assertEqual(conv2.max_tokens, 256)
+            self.assertEqual(cfg2["agent"]["cindy-bridge"]["options"]["maxTokens"], 256)
+            self.assertEqual(cfg2["provider"]["custom_provider"]["models"]["custom_model"]["limit"]["output"], 256)
+            self.assertEqual(cfg2["provider"]["custom_provider"]["models"]["custom_model"]["limit"]["context"], 32000)
+        finally:
+            transport._close(conv2, abort=False)
+
+    def test_invalid_max_tokens_rejected_with_400(self):
+        transport = OpenCodeTransport("http://127.0.0.1:9999", request_json=lambda *a, **kw: {"id": "ses_1"}, stream_open=lambda conv: io.BytesIO(b""))
+        handler = Handler()
+        for invalid in [-1, 0, "100", True, 3.14]:
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(BridgeError) as raised:
+                    transport.chat({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": invalid}, handler, [])
+                self.assertEqual(raised.exception.status, 400)
+                self.assertEqual(raised.exception.code, "invalid_request")
+
     def test_transport_shutdown_closes_all_active_conversations(self):
         closed = []
         transport = OpenCodeTransport("http://unused")

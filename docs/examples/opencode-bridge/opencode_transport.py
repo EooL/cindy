@@ -102,6 +102,7 @@ class Conversation:
     closed: threading.Event = field(default_factory=threading.Event)
     last_used: float = field(default_factory=time.monotonic)
     prefix: str = "cindy"
+    max_tokens: int | None = None
 
 
 class OpenCodeTransport:
@@ -287,9 +288,14 @@ class OpenCodeTransport:
         with self.lock:
             if len(self.conversations) >= 32:
                 raise BridgeError(429, "bridge_busy", "Too many active bridge conversations.")
+        max_tokens = request.get("max_completion_tokens")
+        if max_tokens is None:
+            max_tokens = request.get("max_tokens")
+        if max_tokens is not None and (not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0):
+            raise BridgeError(400, "invalid_request", "max_tokens must be a positive integer.")
         token = uuid.uuid4().hex
         directory = tempfile.mkdtemp(prefix="cindy-opencode-")
-        conversation = Conversation(token, directory, request["model"], tools, choice)
+        conversation = Conversation(token, directory, request["model"], tools, choice, max_tokens=max_tokens)
         with self.lock:
             if len(self.conversations) >= 32:
                 try:
@@ -299,11 +305,40 @@ class OpenCodeTransport:
                 raise BridgeError(429, "bridge_busy", "Too many active bridge conversations.")
             self.conversations[token] = conversation
         try:
+            provider, model = "opencode", request["model"]
+            match = next((m for m in models if m["id"] == request["model"]), None)
+            if match:
+                provider = match["provider"]
+                model = request["model"] if provider == "opencode" else request["model"].removeprefix(provider + "/")
+            elif "/" in model:
+                provider, model = model.split("/", 1)
             # Cindy's harness owns context management. Native OpenCode compaction can
             # otherwise loop forever for a small local model before returning a reply.
             # Force share: disabled to prevent leaking system instructions, history, or image data.
-            config = {"compaction": {"auto": False}, "share": "disabled", "agent": {"cindy-bridge": {
-                "description": "Model transport for Cindy", "mode": "primary"}}}
+            # Configure agent and model limits to honor the caller's output token cap.
+            config = {
+                "compaction": {"auto": False},
+                "share": "disabled",
+                "agent": {
+                    "cindy-bridge": {
+                        "description": "Model transport for Cindy",
+                        "mode": "primary",
+                        **({"options": {"maxTokens": max_tokens, "max_tokens": max_tokens}} if max_tokens is not None else {})
+                    }
+                }
+            }
+            if max_tokens is not None:
+                context_limit = (match or {}).get("context_window", 128000)
+                config["provider"] = {
+                    provider: {
+                        "models": {
+                            model: {
+                                "limit": {"context": context_limit, "output": max_tokens},
+                                "options": {"maxTokens": max_tokens, "max_tokens": max_tokens}
+                            }
+                        }
+                    }
+                }
             Path(directory, "opencode.json").write_text(json.dumps(config), encoding="utf-8")
             # Each request owns an OpenCode instance, MCP namespace, and permission rules.
             # Discover built-in and configured MCP tools, then disable all of them.
@@ -331,13 +366,6 @@ class OpenCodeTransport:
             session = self.request_json("/session", conversation,
                 {"title": "Cindy Bridge: " + token, "permission": permissions})
             conversation.session_id = session["id"]
-            provider, model = "opencode", request["model"]
-            match = next((m for m in models if m["id"] == request["model"]), None)
-            if match:
-                provider = match["provider"]
-                model = request["model"] if provider == "opencode" else request["model"].removeprefix(provider + "/")
-            elif "/" in model:
-                provider, model = model.split("/", 1)
             # Preserve roles, tool IDs, and multimodal blocks in a lossless history envelope.
             # System instructions stay in OpenCode's system field, never in a user role.
             system = "\n\n".join(m["content"] for m in request["messages"]
@@ -479,6 +507,11 @@ class OpenCodeTransport:
             raise BridgeError(400, "invalid_request", "A model ID is required.")
         if not isinstance(request.get("messages"), list) or not request["messages"] or not all(isinstance(m, dict) for m in request["messages"]):
             raise BridgeError(400, "invalid_request", "A nonempty messages array is required.")
+        max_tokens = request.get("max_completion_tokens")
+        if max_tokens is None:
+            max_tokens = request.get("max_tokens")
+        if max_tokens is not None and (not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0):
+            raise BridgeError(400, "invalid_request", "max_tokens must be a positive integer.")
         self._reap()
         conversation = self._resume(request)
         if conversation is None:
