@@ -112,13 +112,24 @@ class OpenCodeTransport:
         self.conversations = {}
         self.calls = {}
         self.lock = threading.Lock()
-        self.request_json = request_json or self._request_json
+        if request_json is not None:
+            import inspect
+            sig = inspect.signature(request_json)
+            has_method = any(p.name == "method" or p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+            if not has_method:
+                def wrapped_request_json(path, conversation, body=None, method=None):
+                    return request_json(path, conversation, body)
+                self.request_json = wrapped_request_json
+            else:
+                self.request_json = request_json
+        else:
+            self.request_json = self._request_json
         self.stream_open = stream_open or self._stream_open
 
     def _url(self, path, conversation):
         return self.base_url + path + "?" + urllib.parse.urlencode({"directory": conversation.directory})
 
-    def _request(self, path, conversation, body=None):
+    def _request(self, path, conversation, body=None, method=None):
         headers = {"Content-Type": "application/json"}
         # Server auth is configured explicitly through env, never extracted from a CLI login.
         password = os.environ.get("OPENCODE_SERVER_PASSWORD")
@@ -127,11 +138,11 @@ class OpenCodeTransport:
             pair = os.environ.get("OPENCODE_SERVER_USERNAME", "opencode") + ":" + password
             headers["Authorization"] = "Basic " + base64.b64encode(pair.encode()).decode()
         return urllib.request.Request(self._url(path, conversation),
-            data=None if body is None else json.dumps(body).encode(), headers=headers)
+            data=None if body is None else json.dumps(body).encode(), headers=headers, method=method)
 
-    def _request_json(self, path, conversation, body=None):
+    def _request_json(self, path, conversation, body=None, method=None):
         try:
-            with urllib.request.urlopen(self._request(path, conversation, body), timeout=self.timeout) as response:
+            with urllib.request.urlopen(self._request(path, conversation, body, method=method), timeout=self.timeout) as response:
                 raw = response.read()
                 return json.loads(raw) if raw else None
         except urllib.error.HTTPError as error:
@@ -165,6 +176,12 @@ class OpenCodeTransport:
         if abort and conversation.session_id:
             try:
                 self.request_json(f"/session/{conversation.session_id}/abort", conversation, {})
+            except BridgeError:
+                pass
+        # Delete bridge-owned session so OpenCode does not accumulate orphan sessions.
+        if conversation.session_id:
+            try:
+                self.request_json(f"/session/{conversation.session_id}", conversation, method="DELETE")
             except BridgeError:
                 pass
         # Dispose only this bridge-created instance, never a user's project instance.
@@ -345,6 +362,7 @@ class OpenCodeTransport:
             response["result"] = {"protocolVersion": request.get("params", {}).get("protocolVersion", "2024-11-05"),
                                   "capabilities": {"tools": {}}, "serverInfo": {"name": "cindy-tool-relay", "version": "2.0.0"}}
         elif method == "ping":
+            # Conforming MCP JSON-RPC ping requires result to be an empty object {}.
             response["result"] = {}
         elif method == "tools/list":
             response["result"] = {"tools": list(conversation.tools.values())}

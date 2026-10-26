@@ -312,6 +312,41 @@ class BridgeTests(unittest.TestCase):
                 self.assertEqual(env["OPENCODE_BRIDGE_CONFIG"], expected)
                 self.assertTrue(Path(env["OPENCODE_BRIDGE_CONFIG"]).is_absolute())
 
+    def test_environment_resolves_relative_db_path(self):
+        import os
+        from pathlib import Path
+        with patch.dict(os.environ, {"OPENCODE_BRIDGE_DB": "relative/telemetry.db"}):
+            with tempfile.TemporaryDirectory() as tmp_state:
+                env = start_bridge.environment(Path(tmp_state))
+                expected = str(Path("relative/telemetry.db").resolve())
+                self.assertEqual(env["OPENCODE_BRIDGE_DB"], expected)
+                self.assertTrue(Path(env["OPENCODE_BRIDGE_DB"]).is_absolute())
+
+    def test_close_deletes_bridge_owned_session(self):
+        recorded_calls = []
+        def mock_request(path, conversation, body=None, method=None):
+            recorded_calls.append((path, body, method))
+            return {}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            transport = OpenCodeTransport("http://127.0.0.1:9999", request_json=mock_request)
+            conv = Conversation("tok_del", tmpdir, "model", {}, "auto", session_id="ses_to_delete")
+            transport.conversations["tok_del"] = conv
+            transport._close(conv, abort=False)
+            delete_calls = [(p, m) for p, b, m in recorded_calls if p == "/session/ses_to_delete" and m == "DELETE"]
+            self.assertEqual(len(delete_calls), 1)
+
+    def test_mcp_ping_returns_empty_json_object(self):
+        transport = OpenCodeTransport("http://unused")
+        conv = Conversation("tok_ping", "/tmp", "model", {}, "auto")
+        transport.conversations["tok_ping"] = conv
+        res = transport.mcp("tok_ping", {"jsonrpc": "2.0", "id": 99, "method": "ping"})
+        self.assertEqual(res["result"], {})
+        self.assertIsInstance(res["result"], dict)
+        raw = json.dumps(res)
+        self.assertIn('"result": {}', raw)
+        self.assertNotIn('"result": "{}"', raw)
+
 
 if __name__ == '__main__':
     unittest.main()

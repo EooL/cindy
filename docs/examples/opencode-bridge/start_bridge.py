@@ -23,6 +23,9 @@ def environment(state):
     if resolved_config.exists():
         env["OPENCODE_CONFIG"] = original_config
     env["OPENCODE_BRIDGE_CONFIG"] = original_config
+    db_env = env.get("OPENCODE_BRIDGE_DB")
+    if db_env:
+        env["OPENCODE_BRIDGE_DB"] = str(Path(db_env).resolve())
     profile = state / "config"
     profile.mkdir(parents=True, exist_ok=True)
     env["XDG_CONFIG_HOME"] = str(profile)
