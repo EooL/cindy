@@ -1,0 +1,89 @@
+"""Start an owned OpenCode server and bridge without modifying the CLI profile."""
+import os
+from pathlib import Path
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+
+from opencode_cindy_bridge import opencode_command
+
+
+def environment(state):
+    env = dict(os.environ)
+    original_config = env.get("OPENCODE_BRIDGE_CONFIG", str(
+        Path(env.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "opencode/opencode.json"))
+    # OpenCode itself reads the selected provider config. Never copy/parse keys.
+    if Path(original_config).exists():
+        env["OPENCODE_CONFIG"] = original_config
+    env["OPENCODE_BRIDGE_CONFIG"] = original_config
+    profile = state / "config"
+    profile.mkdir(parents=True, exist_ok=True)
+    env["XDG_CONFIG_HOME"] = str(profile)
+    env["OPENCODE_DISABLE_CLAUDE_CODE"] = "1"
+    env["OPENCODE_DISABLE_CLAUDE_CODE_PROMPT"] = "1"
+    env["OPENCODE_DISABLE_CLAUDE_CODE_SKILLS"] = "1"
+    env["OPENCODE_DISABLE_EXTERNAL_SKILLS"] = "1"
+    env["OPENCODE_DISABLE_AUTOCOMPACT"] = "1"
+    # XDG_DATA_HOME/HOME remain unchanged: native provider auth stays with OpenCode.
+    return env
+
+
+def main():
+    state = Path(os.environ.get("OPENCODE_BRIDGE_STATE", str(
+        Path(tempfile.gettempdir()) / "cindy-opencode-server"))).resolve()
+    state.mkdir(parents=True, exist_ok=True)
+    env = environment(state)
+    server_port = int(env.get("OPENCODE_SERVER_PORT", "14782"))
+    bridge_port = int(env.get("OPENCODE_BRIDGE_PORT", "11437"))
+    for port in (server_port, bridge_port):
+        with socket.socket() as sock:
+            if sock.connect_ex(("127.0.0.1", port)) == 0:
+                raise RuntimeError(f"Port {port} is already in use. Stop its owner or select different bridge/server ports.")
+    children = []
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    try:
+        server = subprocess.Popen(opencode_command() + ["serve", "--pure", "--hostname", "127.0.0.1", "--port", str(server_port)],
+            cwd=state, env=env, creationflags=flags, stdout=sys.stdout, stderr=sys.stderr)
+        children.append(server)
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if server.poll() is not None:
+                raise RuntimeError("The owned OpenCode server exited during startup.")
+            try:
+                req = urllib.request.Request(f"http://127.0.0.1:{server_port}/global/health")
+                if env.get("OPENCODE_SERVER_PASSWORD"):
+                    import base64
+                    value = env.get("OPENCODE_SERVER_USERNAME", "opencode") + ":" + env["OPENCODE_SERVER_PASSWORD"]
+                    req.add_header("Authorization", "Basic " + base64.b64encode(value.encode()).decode())
+                with urllib.request.urlopen(req, timeout=1) as response:
+                    if response.status == 200:
+                        break
+            except OSError:
+                time.sleep(0.1)
+        else:
+            raise RuntimeError("The owned OpenCode server did not become healthy within 30 seconds.")
+        bridge = subprocess.Popen([sys.executable, "-u", str(Path(__file__).with_name("opencode_cindy_bridge.py"))],
+            cwd=state, env=env, creationflags=flags, stdout=sys.stdout, stderr=sys.stderr)
+        children.append(bridge)
+        while all(child.poll() is None for child in children):
+            time.sleep(0.2)
+        raise RuntimeError("The owned OpenCode server or bridge exited unexpectedly.")
+    finally:
+        for child in reversed(children):
+            if child.poll() is None:
+                child.terminate()
+                try:
+                    child.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass

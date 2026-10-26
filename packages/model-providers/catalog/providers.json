@@ -2199,7 +2199,7 @@
     {
       "id": "opencode-cli",
       "name": "OpenCode CLI",
-      "docsUrl": "https://gist.github.com/EooL/5e954d821491e35b3a807562093a2f02",
+      "docsUrl": "https://github.com/makecindy/cindy/tree/main/docs/examples/opencode-bridge",
       "authMethod": "none",
       "models": [],
       "runtimes": {
