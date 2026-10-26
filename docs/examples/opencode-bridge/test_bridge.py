@@ -487,7 +487,8 @@ class BridgeTests(unittest.TestCase):
         try:
             cfg = json.loads(pathlib.Path(conv.directory, "opencode.json").read_text(encoding="utf-8"))
             self.assertEqual(conv.max_tokens, 128)
-            self.assertEqual(cfg["agent"]["cindy-bridge"]["options"]["maxTokens"], 128)
+            self.assertNotIn("options", cfg["agent"]["cindy-bridge"])
+            self.assertNotIn("options", cfg["provider"]["opencode"]["models"]["test-model"])
             self.assertEqual(cfg["provider"]["opencode"]["models"]["test-model"]["limit"]["output"], 128)
             self.assertEqual(cfg["provider"]["opencode"]["models"]["test-model"]["limit"]["context"], 64000)
         finally:
@@ -501,7 +502,7 @@ class BridgeTests(unittest.TestCase):
         try:
             cfg2 = json.loads(pathlib.Path(conv2.directory, "opencode.json").read_text(encoding="utf-8"))
             self.assertEqual(conv2.max_tokens, 256)
-            self.assertEqual(cfg2["agent"]["cindy-bridge"]["options"]["maxTokens"], 256)
+            self.assertNotIn("options", cfg2["agent"]["cindy-bridge"])
             self.assertEqual(cfg2["provider"]["custom_provider"]["models"]["custom_model"]["limit"]["output"], 256)
             self.assertEqual(cfg2["provider"]["custom_provider"]["models"]["custom_model"]["limit"]["context"], 32000)
         finally:

@@ -323,7 +323,6 @@ class OpenCodeTransport:
                     "cindy-bridge": {
                         "description": "Model transport for Cindy",
                         "mode": "primary",
-                        **({"options": {"maxTokens": max_tokens, "max_tokens": max_tokens}} if max_tokens is not None else {})
                     }
                 }
             }
@@ -333,8 +332,9 @@ class OpenCodeTransport:
                     provider: {
                         "models": {
                             model: {
+                                # limit.output is OpenCode's output cap; "options" are forwarded
+                                # verbatim to the provider API, which rejects unknown maxTokens.
                                 "limit": {"context": context_limit, "output": max_tokens},
-                                "options": {"maxTokens": max_tokens, "max_tokens": max_tokens}
                             }
                         }
                     }
