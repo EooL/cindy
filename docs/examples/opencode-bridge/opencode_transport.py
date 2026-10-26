@@ -246,6 +246,42 @@ class OpenCodeTransport:
             raise BridgeError(400, "invalid_tool_choice", "tool_choice required needs tools.")
         return tools, choice
 
+    @staticmethod
+    def _client_disconnected(handler):
+        if handler is None:
+            return False
+        if getattr(handler, "disconnected", False):
+            return True
+        conn = getattr(handler, "connection", None)
+        if conn is None:
+            return False
+        if callable(getattr(conn, "is_disconnected", None)):
+            try:
+                return conn.is_disconnected()
+            except Exception:
+                return True
+        if not hasattr(conn, "fileno"):
+            return False
+        try:
+            fd = conn.fileno()
+            if not isinstance(fd, int) or fd < 0:
+                return False
+        except Exception:
+            return False
+        try:
+            import select
+            r, _, x = select.select([conn], [], [conn], 0)
+            if x:
+                return True
+            if r:
+                import socket as _socket
+                peek = conn.recv(1, _socket.MSG_PEEK)
+                if not peek:
+                    return True
+        except (ValueError, OSError):
+            return True
+        return False
+
     def _new(self, request, models):
         tools, choice = self._definitions(request)
         with self.lock:
@@ -486,10 +522,18 @@ class OpenCodeTransport:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise BridgeError(504, "opencode_timeout", "OpenCode inference timed out.")
+                if self._client_disconnected(handler):
+                    self._close(conversation, abort=True)
+                    return
                 try:
-                    kind, event = conversation.events.get(timeout=remaining)
+                    kind, event = conversation.events.get(timeout=min(remaining, 0.25))
                 except queue.Empty:
-                    raise BridgeError(504, "opencode_timeout", "OpenCode inference timed out.") from None
+                    if self._client_disconnected(handler):
+                        self._close(conversation, abort=True)
+                        return
+                    if remaining <= 0.25:
+                        raise BridgeError(504, "opencode_timeout", "OpenCode inference timed out.") from None
+                    continue
                 if kind == "error":
                     raise event
                 if kind == "delta":
@@ -551,8 +595,10 @@ class OpenCodeTransport:
             handler.wfile.write(("data: " + json.dumps({"error": {"type": error.code, "message": str(error)}}) + "\n\n").encode())
             handler.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
-            self._close(conversation)
-            raise
+            if hasattr(handler, "close_connection"):
+                handler.close_connection = True
+            self._close(conversation, abort=True)
+            return
         finally:
             conversation.last_used = time.monotonic()
             conversation.lock.release()

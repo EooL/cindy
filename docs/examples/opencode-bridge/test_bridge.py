@@ -134,6 +134,74 @@ class BridgeTests(unittest.TestCase):
                         self.assertEqual(raised.exception.status, 502)
                         self.assertIsNone(handler.json)
 
+    def test_client_disconnect_aborts_opencode_before_first_delta(self):
+        aborted = False
+        def mock_request(path, conversation, body=None, method=None, timeout=None):
+            nonlocal aborted
+            if "/abort" in path:
+                aborted = True
+            return {}
+
+        transport = OpenCodeTransport('http://unused', request_json=mock_request)
+        conversation = Conversation('fixture', '/fixture', 'fixture', {}, 'auto', session_id='ses_123')
+        handler = Handler()
+        handler.disconnected = True
+        with patch.object(transport, '_new', return_value=conversation):
+            transport.chat({'model': 'fixture', 'messages': [{'role': 'user', 'content': 'Hi'}], 'stream': True}, handler, [])
+        self.assertTrue(aborted)
+        self.assertTrue(conversation.closed.is_set())
+
+    def test_client_disconnect_aborts_nonstreaming_call(self):
+        aborted = False
+        def mock_request(path, conversation, body=None, method=None, timeout=None):
+            nonlocal aborted
+            if "/abort" in path:
+                aborted = True
+            return {}
+
+        transport = OpenCodeTransport('http://unused', request_json=mock_request)
+        conversation = Conversation('fixture', '/fixture', 'fixture', {}, 'auto', session_id='ses_123')
+        handler = Handler()
+        handler.disconnected = True
+        with patch.object(transport, '_new', return_value=conversation):
+            transport.chat({'model': 'fixture', 'messages': [{'role': 'user', 'content': 'Hi'}], 'stream': False}, handler, [])
+        self.assertTrue(aborted)
+        self.assertTrue(conversation.closed.is_set())
+
+    def test_socket_disconnect_detection_aborts_active_turn(self):
+        import socket
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind(('127.0.0.1', 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+
+        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        client.connect(('127.0.0.1', port))
+        conn, _ = server.accept()
+        server.close()
+
+        handler = Handler()
+        handler.connection = conn
+
+        aborted = False
+        def mock_request(path, conversation, body=None, method=None, timeout=None):
+            nonlocal aborted
+            if "/abort" in path:
+                aborted = True
+            return {}
+
+        transport = OpenCodeTransport('http://unused', request_json=mock_request)
+        conversation = Conversation('fixture', '/fixture', 'fixture', {}, 'auto', session_id='ses_123')
+
+        client.close()
+
+        with patch.object(transport, '_new', return_value=conversation):
+            transport.chat({'model': 'fixture', 'messages': [{'role': 'user', 'content': 'Hi'}], 'stream': True}, handler, [])
+
+        conn.close()
+        self.assertTrue(aborted)
+        self.assertTrue(conversation.closed.is_set())
+
     def test_completed_tool_history_does_not_prevent_new_user_turn(self):
         transport = OpenCodeTransport('http://unused')
         self.assertIsNone(transport._resume({'model': 'fixture', 'messages': [
