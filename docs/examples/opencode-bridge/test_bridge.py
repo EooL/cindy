@@ -353,6 +353,20 @@ class BridgeTests(unittest.TestCase):
         self.assertIn('"result": {}', raw)
         self.assertNotIn('"result": "{}"', raw)
 
+    def test_new_forces_sharing_disabled_in_opencode_config(self):
+        transport = OpenCodeTransport("http://127.0.0.1:9999", request_json=lambda *a, **kw: {"id": "ses_1"}, stream_open=lambda conv: io.BytesIO(b""))
+        transport.callback_base = "http://127.0.0.1:9999"
+        conv = transport._new(
+            {"model": "test-model", "messages": [{"role": "user", "content": "hi"}]},
+            [{"id": "test-model", "provider": "opencode"}],
+        )
+        try:
+            cfg = json.loads(pathlib.Path(conv.directory, "opencode.json").read_text(encoding="utf-8"))
+            self.assertEqual(cfg.get("share"), "disabled")
+            self.assertFalse(cfg.get("compaction", {}).get("auto"))
+        finally:
+            transport._close(conv, abort=False)
+
 
 if __name__ == '__main__':
     unittest.main()

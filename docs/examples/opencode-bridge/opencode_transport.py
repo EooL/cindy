@@ -239,7 +239,8 @@ class OpenCodeTransport:
         try:
             # Cindy's harness owns context management. Native OpenCode compaction can
             # otherwise loop forever for a small local model before returning a reply.
-            config = {"compaction": {"auto": False}, "agent": {"cindy-bridge": {
+            # Force share: disabled to prevent leaking system instructions, history, or image data.
+            config = {"compaction": {"auto": False}, "share": "disabled", "agent": {"cindy-bridge": {
                 "description": "Model transport for Cindy", "mode": "primary"}}}
             Path(directory, "opencode.json").write_text(json.dumps(config), encoding="utf-8")
             # Each request owns an OpenCode instance, MCP namespace, and permission rules.

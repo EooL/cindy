@@ -34,6 +34,8 @@ def environment(state):
     env["OPENCODE_DISABLE_CLAUDE_CODE_SKILLS"] = "1"
     env["OPENCODE_DISABLE_EXTERNAL_SKILLS"] = "1"
     env["OPENCODE_DISABLE_AUTOCOMPACT"] = "1"
+    env["OPENCODE_DISABLE_SHARE"] = "1"
+    env["OPENCODE_SHARE"] = "disabled"
     # XDG_DATA_HOME/HOME remain unchanged: native provider auth stays with OpenCode.
     return env
 
