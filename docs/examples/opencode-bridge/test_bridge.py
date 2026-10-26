@@ -200,6 +200,23 @@ class BridgeTests(unittest.TestCase):
         after = set(pathlib.Path(tempfile.gettempdir()).glob('cindy-opencode-*'))
         self.assertEqual(after - before, set())
 
+    def test_usage_fetch_failure_still_returns_completed_reply(self):
+        call_count = 0
+        def mock_request(path, conversation, body=None):
+            nonlocal call_count
+            call_count += 1
+            if body is not None:
+                return {'info': {'finish': 'stop'}, 'parts': [{'type': 'text', 'text': 'Completed successfully'}]}
+            raise BridgeError(502, 'opencode_http_error', 'Transient network glitch during usage fetch')
+
+        transport = OpenCodeTransport('http://unused', request_json=mock_request)
+        conversation = Conversation('fixture', '/fixture', 'fixture', {}, 'auto', session_id='ses_123')
+        transport._run(conversation, {'model': {'providerID': 'opencode', 'modelID': 'fixture'}, 'parts': []})
+        kind, (result, usage) = conversation.events.get_nowait()
+        self.assertEqual(kind, 'done')
+        self.assertEqual(result['parts'][0]['text'], 'Completed successfully')
+        self.assertIsNone(usage)
+
 
 if __name__ == '__main__':
     unittest.main()

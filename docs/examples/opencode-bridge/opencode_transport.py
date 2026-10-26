@@ -317,8 +317,12 @@ class OpenCodeTransport:
             info = (result or {}).get("info", {})
             if info.get("error"):
                 raise BridgeError(502, "opencode_inference_failed", "OpenCode inference failed: " + str(info["error"].get("name", "unknown error")))
-            messages = self.request_json(f"/session/{conversation.session_id}/message", conversation)
-            usage = usage_from_messages(messages)
+            usage = None
+            try:
+                messages = self.request_json(f"/session/{conversation.session_id}/message", conversation)
+                usage = usage_from_messages(messages)
+            except Exception:
+                pass
             # The completed response is authoritative, including output if SSE delivery lagged.
             conversation.events.put(("done", (result, usage)))
         except BridgeError as error:
