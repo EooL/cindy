@@ -673,6 +673,49 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(raised.exception.status, 400)
         self.assertEqual(raised.exception.code, "unsupported_image")
 
+    def test_concurrent_empty_model_discovery_shares_cached_result(self):
+        discover_calls = 0
+        def slow_empty_discover():
+            nonlocal discover_calls
+            discover_calls += 1
+            import time
+            time.sleep(0.05)
+            return []
+
+        with patch.object(bridge, "discover_dynamic_models", side_effect=slow_empty_discover):
+            with bridge.CACHE_LOCK:
+                bridge.MODELS_CACHE["data"] = []
+                bridge.MODELS_CACHE["ts"] = 0.0
+
+            results = []
+            threads = [threading.Thread(target=lambda: results.append(bridge.get_cached_models())) for _ in range(5)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            self.assertEqual(len(results), 5)
+            self.assertEqual(discover_calls, 1)
+            self.assertEqual(results[0], [])
+
+    def test_shutdown_endpoint_returns_200(self):
+        handler = Handler()
+        handler.path = "/shutdown"
+        handler.headers = {"Content-Length": "2"}
+        handler.rfile = io.BytesIO(b"{}")
+        with patch.object(bridge.threading, "Thread"):
+            bridge.OpenCodeBridgeHandler.do_POST(handler)
+        self.assertEqual(handler.status, 200)
+        self.assertEqual(handler.json, {"status": "shutting_down"})
+
+    def test_stop_child_graceful_ipc_attempt(self):
+        mock_child = unittest.mock.Mock()
+        mock_child.poll.return_value = None
+        with patch("urllib.request.urlopen") as mock_open:
+            start_bridge.stop_child(mock_child, bridge_port=11437, timeout=1)
+            self.assertTrue(mock_open.called)
+            mock_child.wait.assert_called_with(timeout=1)
+
 
 if __name__ == '__main__':
     unittest.main()

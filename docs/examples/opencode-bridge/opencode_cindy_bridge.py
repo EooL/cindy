@@ -45,6 +45,8 @@ MODELS_CACHE = {"ts": 0.0, "data": []}
 CACHE_LOCK = threading.Lock()
 DISCOVERY_LOCK = threading.Lock()
 DISCOVERY_TIMEOUT = int(os.environ.get("OPENCODE_DISCOVERY_TIMEOUT", "8"))
+CACHE_TTL = int(os.environ.get("OPENCODE_CACHE_TTL", "900"))
+EMPTY_CACHE_TTL = int(os.environ.get("OPENCODE_EMPTY_CACHE_TTL", "60"))
 MAX_BODY_BYTES = int(os.environ.get("OPENCODE_BRIDGE_MAX_BODY_BYTES", str(64 * 1024 * 1024)))
 
 def load_opencode_config():
@@ -198,28 +200,33 @@ def discover_dynamic_models():
 
     return models
 
+def _is_cache_valid(now):
+    ts = MODELS_CACHE.get("ts", 0.0)
+    if ts <= 0:
+        return False
+    data = MODELS_CACHE.get("data")
+    ttl = CACHE_TTL if data else EMPTY_CACHE_TTL
+    return (now - ts) < ttl
+
+
 def get_cached_models(force=False):
     now = time.time()
     with CACHE_LOCK:
-        if not force and MODELS_CACHE["data"] and (now - MODELS_CACHE["ts"] < 900): # 15 minutes cache
-            return MODELS_CACHE["data"]
+        if not force and _is_cache_valid(now):
+            return list(MODELS_CACHE.get("data", []))
 
     # Coalesce concurrent discovery calls into a single-flight execution
     with DISCOVERY_LOCK:
         now = time.time()
         with CACHE_LOCK:
-            if not force and MODELS_CACHE["data"] and (now - MODELS_CACHE["ts"] < 900):
-                return MODELS_CACHE["data"]
+            if not force and _is_cache_valid(now):
+                return list(MODELS_CACHE.get("data", []))
 
         new_models = discover_dynamic_models()
-        if new_models:
-            with CACHE_LOCK:
-                MODELS_CACHE["data"] = new_models
-                MODELS_CACHE["ts"] = now
-            return new_models
-
         with CACHE_LOCK:
-            return MODELS_CACHE.get("data", [])
+            MODELS_CACHE["data"] = new_models if isinstance(new_models, list) else []
+            MODELS_CACHE["ts"] = now
+            return list(MODELS_CACHE["data"])
 
 def get_opencode_stats(db_path=None, now_ms=None):
     """Read aggregate OpenCode telemetry, not subscription quotas or Cindy's ledger."""
@@ -418,6 +425,17 @@ class OpenCodeBridgeHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(403, {"error": {"type": "forbidden", "code": "forbidden", "message": "Cross-origin request blocked."}})
             return
         path = self.path.split("?", 1)[0]
+        if path in ("/shutdown", "/v1/shutdown"):
+            def _delayed_exit():
+                time.sleep(0.1)
+                try:
+                    TRANSPORT.shutdown()
+                except Exception:
+                    pass
+                os._exit(0)
+            self._send_json(200, {"status": "shutting_down"})
+            threading.Thread(target=_delayed_exit, daemon=True).start()
+            return
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if length <= 0:

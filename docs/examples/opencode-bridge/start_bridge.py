@@ -1,6 +1,7 @@
 """Start an owned OpenCode server and bridge without modifying the CLI profile."""
 import os
 from pathlib import Path
+import signal
 import socket
 import subprocess
 import sys
@@ -60,6 +61,48 @@ def state_directory():
     return state
 
 
+def stop_child(child, bridge_port=None, timeout=5):
+    if child.poll() is not None:
+        return
+    # 1. Attempt graceful IPC shutdown if this is the bridge
+    if bridge_port is not None:
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{bridge_port}/shutdown", data=b"{}", method="POST")
+            req.add_header("Content-Type", "application/json")
+            with urllib.request.urlopen(req, timeout=1.0) as resp:
+                pass
+            child.wait(timeout=timeout)
+            return
+        except Exception:
+            pass
+
+    # 2. Attempt console signal (CTRL_BREAK on Windows if supported, SIGTERM on POSIX)
+    try:
+        if os.name == "nt" and hasattr(signal, "CTRL_BREAK_EVENT"):
+            child.send_signal(signal.CTRL_BREAK_EVENT)
+        else:
+            child.send_signal(signal.SIGTERM)
+        child.wait(timeout=timeout)
+        return
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        pass
+
+    # 3. Fallback to terminate
+    try:
+        child.terminate()
+        child.wait(timeout=timeout)
+        return
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+    # 4. Final fallback to kill
+    try:
+        child.kill()
+        child.wait()
+    except OSError:
+        pass
+
+
 def main():
     state = state_directory()
     env = environment(state)
@@ -70,7 +113,8 @@ def main():
             if sock.connect_ex(("127.0.0.1", port)) == 0:
                 raise RuntimeError(f"Port {port} is already in use. Stop its owner or select different bridge/server ports.")
     children = []
-    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    flags = (subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW) if os.name == "nt" else 0
+    bridge = None
     try:
         server = subprocess.Popen(opencode_command() + ["serve", "--pure", "--hostname", "127.0.0.1", "--port", str(server_port)],
             cwd=state, env=env, creationflags=flags, stdout=sys.stdout, stderr=sys.stderr)
@@ -101,15 +145,8 @@ def main():
     finally:
         for child in reversed(children):
             if child.poll() is None:
-                try:
-                    child.terminate()
-                    child.wait(timeout=5)
-                except (subprocess.TimeoutExpired, OSError):
-                    try:
-                        child.kill()
-                        child.wait()
-                    except OSError:
-                        pass
+                port = bridge_port if child is bridge else None
+                stop_child(child, bridge_port=port, timeout=5)
 
 
 if __name__ == "__main__":
