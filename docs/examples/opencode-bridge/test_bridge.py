@@ -217,6 +217,31 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(result['parts'][0]['text'], 'Completed successfully')
         self.assertIsNone(usage)
 
+    def test_concurrent_model_discovery_is_single_flight(self):
+        discover_calls = 0
+        def slow_discover():
+            nonlocal discover_calls
+            discover_calls += 1
+            import time
+            time.sleep(0.05)
+            return [{"id": "fixture-model", "name": "Fixture", "cost": {"input": 0, "output": 0}}]
+
+        with patch.object(bridge, "discover_dynamic_models", side_effect=slow_discover):
+            with bridge.CACHE_LOCK:
+                bridge.MODELS_CACHE["data"] = []
+                bridge.MODELS_CACHE["ts"] = 0.0
+
+            results = []
+            threads = [threading.Thread(target=lambda: results.append(bridge.get_cached_models())) for _ in range(5)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            self.assertEqual(len(results), 5)
+            self.assertEqual(discover_calls, 1)
+            self.assertEqual(results[0][0]["id"], "fixture-model")
+
 
 if __name__ == '__main__':
     unittest.main()

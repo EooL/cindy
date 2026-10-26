@@ -40,6 +40,8 @@ OPENCODE_DB_PATH = os.environ.get("OPENCODE_BRIDGE_DB", str(Path(os.environ.get(
 
 MODELS_CACHE = {"ts": 0.0, "data": []}
 CACHE_LOCK = threading.Lock()
+DISCOVERY_LOCK = threading.Lock()
+DISCOVERY_TIMEOUT = int(os.environ.get("OPENCODE_DISCOVERY_TIMEOUT", "8"))
 
 def load_opencode_config():
     try:
@@ -84,7 +86,7 @@ def discover_dynamic_models():
             text=True,
             encoding="utf-8",
             errors="ignore",
-            timeout=25
+            timeout=DISCOVERY_TIMEOUT
         )
         if res.returncode == 0 and res.stdout:
             lines = res.stdout.split("\n")
@@ -189,14 +191,22 @@ def get_cached_models(force=False):
         if not force and MODELS_CACHE["data"] and (now - MODELS_CACHE["ts"] < 900): # 15 minutes cache
             return MODELS_CACHE["data"]
 
-    new_models = discover_dynamic_models()
-    if new_models:
+    # Coalesce concurrent discovery calls into a single-flight execution
+    with DISCOVERY_LOCK:
+        now = time.time()
         with CACHE_LOCK:
-            MODELS_CACHE["data"] = new_models
-            MODELS_CACHE["ts"] = now
-        return new_models
+            if not force and MODELS_CACHE["data"] and (now - MODELS_CACHE["ts"] < 900):
+                return MODELS_CACHE["data"]
 
-    return MODELS_CACHE.get("data", [])
+        new_models = discover_dynamic_models()
+        if new_models:
+            with CACHE_LOCK:
+                MODELS_CACHE["data"] = new_models
+                MODELS_CACHE["ts"] = now
+            return new_models
+
+        with CACHE_LOCK:
+            return MODELS_CACHE.get("data", [])
 
 def get_opencode_stats(db_path=None, now_ms=None):
     """Read aggregate OpenCode telemetry, not subscription quotas or Cindy's ledger."""
