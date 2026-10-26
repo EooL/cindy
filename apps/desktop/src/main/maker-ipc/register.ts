@@ -575,7 +575,7 @@ import {
   sessions,
   schedules,
 } from '../localDb/schema.js';
-import { nextBotModelRoute, normalizeBotModelChain, type BotModelRoute } from '../../shared/botModelChain.js';
+import { botModelRouteRuntimeKey, nextBotModelRoute, normalizeBotModelChain, type BotModelRoute } from '../../shared/botModelChain.js';
 import { createBotModelRouteApplier, createBotModelRouteReconciler } from './botModelRouteReconciler.js';
 import {
   cindyAutoRouteToFollow,
@@ -1343,6 +1343,7 @@ import {
   mergeSessionRuntimeProfilePatch,
   pickSessionRuntimeFallback,
   recordFailedSessionRuntimeFallbackCandidate,
+  recordSkippedSessionRuntimeFallbackRoutes,
   recordRecoveredSessionRuntimeMutation,
   recordRecoveredSessionRuntimeAxisMutation,
   recordUserSessionRuntimeAxisMutation,
@@ -16874,6 +16875,12 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       : current.agentKind === 'pi'
         ? 'pi'
         : 'claude';
+    if (excludeFailedAccount) {
+      const exhaustedKeys = chain
+        .filter((candidate) => isSameAccountRoute(candidate, { ...current, harness: currentHarness }))
+        .map(botModelRouteRuntimeKey);
+      recordSkippedSessionRuntimeFallbackRoutes(controlSessionId, exhaustedKeys);
+    }
     const control = getSessionRuntimeControlSnapshot(controlSessionId);
     const [controlSession] = controlSessionId === sessionId ? [{ remoteHostId: row.remoteHostId }]
       : await getDbClient().drizzle.select({ remoteHostId: sessions.remoteHostId })

@@ -13,6 +13,8 @@ export function isAccountUsageExhausted(signals: InterruptedTurnErrorSignals): b
   if (signals.errorStatus === 402) return true;
   // Claude subscription limits carry a structured reset time from the SDK rate_limit_event.
   if (signals.sdkError === 'rate_limit' && typeof signals.usageResetAt === 'number') return true;
+  // Explicit unretryable SDK tags must not be reclassified as account exhaustion from text.
+  if (signals.sdkError && ['invalid_request', 'max_output_tokens'].includes(signals.sdkError)) return false;
   const message = signals.message ?? '';
   // Untagged Claude session-limit envelopes; a known SDK tag must not be reclassified from text.
   const untagged = !signals.sdkError || signals.sdkError === 'unknown';
@@ -20,13 +22,19 @@ export function isAccountUsageExhausted(signals: InterruptedTurnErrorSignals): b
     || (untagged && /\byou['’]ve hit your session limit\b/i.test(message));
 }
 
-type AccountRoute = { harness: string; providerId?: string | null; agentDeviceId?: string | null };
+export type AccountRoute = { harness: string; providerId?: string | null; agentDeviceId?: string | null };
 
 /** Same harness, source and device: an exhausted account cannot be recovered by this route. */
 export function isSameAccountRoute(candidate: AccountRoute, current: AccountRoute): boolean {
-  return candidate.harness === current.harness
-    && (candidate.providerId ?? null) === (current.providerId ?? null)
-    && (candidate.agentDeviceId ?? null) === (current.agentDeviceId ?? null);
+  if ((candidate.agentDeviceId ?? null) !== (current.agentDeviceId ?? null)) {
+    return false;
+  }
+  const candidateProvider = candidate.providerId ?? null;
+  const currentProvider = current.providerId ?? null;
+  if (candidateProvider !== null || currentProvider !== null) {
+    return candidateProvider === currentProvider;
+  }
+  return candidate.harness === current.harness;
 }
 
 /** A failed provider may be replaced, even when retrying that provider is forbidden. */

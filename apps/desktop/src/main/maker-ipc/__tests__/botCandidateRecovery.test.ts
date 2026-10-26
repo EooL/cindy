@@ -3,6 +3,7 @@ import { ScriptTarget, transpileModule } from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 import { canResumeAfterRuntimeFallback, isAccountUsageExhausted, isBotCandidateUnavailable, isSameAccountRoute } from '../botCandidateRecovery';
 import { isInterruptedTurnError, isAcceptedTurnContinuationOnlyReason } from '../interruptedTurnAutoResume';
+import { botModelRouteRuntimeKey, nextBotModelRoute } from '../../../shared/botModelChain';
 
 const source = readFileSync(new URL('../register.ts', import.meta.url), 'utf8');
 
@@ -147,12 +148,27 @@ describe('Bot candidate recovery', () => {
     expect(isBotCandidateUnavailable(signals)).toBe(false);
   });
 
+  it.each([
+    { sdkError: 'invalid_request', message: 'insufficient_quota' },
+    { sdkError: 'invalid_request', message: 'You exceeded your current quota' },
+    { sdkError: 'max_output_tokens', message: 'insufficient_quota' },
+  ])('does not reclassify unretryable SDK tags as account exhaustion %j', (signals) => {
+    expect(isAccountUsageExhausted(signals)).toBe(false);
+    expect(isBotCandidateUnavailable(signals)).toBe(false);
+  });
+
   it('identifies routes that share the exhausted account', () => {
     const current = { harness: 'codex', providerId: 'openai', agentDeviceId: null };
     expect(isSameAccountRoute({ harness: 'codex', providerId: 'openai' }, current)).toBe(true);
     expect(isSameAccountRoute({ harness: 'codex', providerId: 'gemini' }, current)).toBe(false);
-    expect(isSameAccountRoute({ harness: 'claude', providerId: 'openai' }, current)).toBe(false);
+    expect(isSameAccountRoute({ harness: 'claude', providerId: 'openai' }, current)).toBe(true);
     expect(isSameAccountRoute({ harness: 'codex', providerId: 'openai', agentDeviceId: 'other-pc' }, current)).toBe(false);
+
+    // Native subscription routes without a custom providerId share account only if harness matches
+    const currentSub = { harness: 'claude', providerId: null, agentDeviceId: null };
+    expect(isSameAccountRoute({ harness: 'claude', providerId: null }, currentSub)).toBe(true);
+    expect(isSameAccountRoute({ harness: 'codex', providerId: null }, currentSub)).toBe(false);
+    expect(isSameAccountRoute({ harness: 'claude', providerId: 'openai' }, currentSub)).toBe(false);
   });
 
   it.each([
@@ -234,5 +250,30 @@ describe('Bot candidate recovery', () => {
     h.guard.mockReturnValue({ action: 'stop' } as ReturnType<typeof h.guard>);
     expect(h.onResumableTurnError('s', drop, h.item)).toBeNull();
     expect(h.fallback).not.toHaveBeenCalled();
+  });
+
+  it('skips candidates belonging to previously exhausted accounts across chained failures (A1 -> B1 -> A2 -> C1)', () => {
+    const a1 = { harness: 'codex' as const, model: 'gpt-4o', providerId: 'account-a' };
+    const b1 = { harness: 'claude' as const, model: 'sonnet-3-5', providerId: 'account-b' };
+    const a2 = { harness: 'codex' as const, model: 'o1', providerId: 'account-a' };
+    const c1 = { harness: 'codex' as const, model: 'gemini', providerId: 'account-c' };
+    const chain = [a1, b1, a2, c1];
+
+    // When A1 fails with account exhaustion, all candidates sharing account A are skipped:
+    const exhaustedKeysA = chain
+      .filter((candidate) => isSameAccountRoute(candidate, a1))
+      .map(botModelRouteRuntimeKey);
+    const visitedRoutes = [...exhaustedKeysA];
+
+    // First recovery selects B1:
+    const firstCandidate = nextBotModelRoute(chain, a1, visitedRoutes);
+    expect(firstCandidate).toMatchObject(b1);
+
+    // B1 is visited / executed:
+    visitedRoutes.push(botModelRouteRuntimeKey(b1));
+
+    // When B1 subsequently fails, recovery from B1 still remembers account A is exhausted and skips A2, selecting C1:
+    const secondCandidate = nextBotModelRoute(chain, b1, visitedRoutes);
+    expect(secondCandidate).toMatchObject(c1);
   });
 });
