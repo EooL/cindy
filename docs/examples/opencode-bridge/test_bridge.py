@@ -245,7 +245,7 @@ class BridgeTests(unittest.TestCase):
 
     def test_relay_tool_enablement_restricted_to_declared_tools(self):
         recorded_requests = []
-        def mock_request(path, conversation, body=None):
+        def mock_request(path, conversation, body=None, method=None):
             recorded_requests.append((path, body))
             if path == "/experimental/tool/ids":
                 return ["builtin_bash", "cindy_extra_other", "cindy_my_tool"]
@@ -265,16 +265,19 @@ class BridgeTests(unittest.TestCase):
             },
             [{"id": "test-model", "provider": "opencode"}],
         )
-        session_call = next(body for path, body in recorded_requests if path == "/session")
-        permissions = session_call["permission"]
-        self.assertIn({"permission": "*", "pattern": "*", "action": "deny"}, permissions)
-        self.assertIn({"permission": "cindy_my_tool", "pattern": "*", "action": "allow"}, permissions)
-        allowed_perms = [p["permission"] for p in permissions if p.get("action") == "allow"]
-        self.assertEqual(allowed_perms, ["cindy_my_tool"])
+        try:
+            session_call = next(body for path, body in recorded_requests if path == "/session")
+            permissions = session_call["permission"]
+            self.assertIn({"permission": "*", "pattern": "*", "action": "deny"}, permissions)
+            self.assertIn({"permission": "cindy_my_tool", "pattern": "*", "action": "allow"}, permissions)
+            allowed_perms = [p["permission"] for p in permissions if p.get("action") == "allow"]
+            self.assertEqual(allowed_perms, ["cindy_my_tool"])
+        finally:
+            transport._close(conv, abort=False)
 
     def test_relay_tool_flags_disable_unrelated_mcp_namespaces(self):
         recorded_requests = []
-        def mock_request(path, conversation, body=None):
+        def mock_request(path, conversation, body=None, method=None):
             recorded_requests.append((path, body))
             if path == "/experimental/tool/ids":
                 return ["builtin_bash", "cindy_extra_other", "cindy_my_tool"]
@@ -295,12 +298,15 @@ class BridgeTests(unittest.TestCase):
                 },
                 [{"id": "test-model", "provider": "opencode"}],
             )
-            # Find the _run thread invocation
-            run_call = next(call for call in mock_thread.call_args_list if call.kwargs.get("args") and len(call.kwargs["args"]) == 2)
-            payload = run_call.kwargs["args"][1]
-            self.assertFalse(payload["tools"]["builtin_bash"])
-            self.assertFalse(payload["tools"]["cindy_extra_other"])
-            self.assertTrue(payload["tools"]["cindy_my_tool"])
+            try:
+                # Find the _run thread invocation
+                run_call = next(call for call in mock_thread.call_args_list if call.kwargs.get("args") and len(call.kwargs["args"]) == 2)
+                payload = run_call.kwargs["args"][1]
+                self.assertFalse(payload["tools"]["builtin_bash"])
+                self.assertFalse(payload["tools"]["cindy_extra_other"])
+                self.assertTrue(payload["tools"]["cindy_my_tool"])
+            finally:
+                transport._close(conv, abort=False)
 
     def test_environment_resolves_relative_config_path(self):
         import os
