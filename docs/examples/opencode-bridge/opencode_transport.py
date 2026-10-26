@@ -570,6 +570,10 @@ class OpenCodeTransport:
                 handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
                 handler.send_header("Cache-Control", "no-cache")
                 handler.send_header("Connection", "close")
+                origin_header = handler._verify_origin() if hasattr(handler, "_verify_origin") else None
+                if origin_header:
+                    handler.send_header("Access-Control-Allow-Origin", origin_header)
+                    handler.send_header("Vary", "Origin")
                 handler.end_headers()
                 handler.close_connection = True
                 started = True

@@ -596,6 +596,42 @@ class BridgeTests(unittest.TestCase):
                 self.assertEqual(h2.status, 204)
                 self.assertEqual(h2.headers.get("Access-Control-Allow-Origin"), trusted)
 
+    def test_is_model_free_requires_all_chargeable_dimensions_to_be_zero(self):
+        # Truly free models
+        self.assertTrue(bridge.is_model_free({"input": 0, "output": 0}))
+        self.assertTrue(bridge.is_model_free({"input": 0.0, "output": 0.0, "cacheRead": 0, "cacheWrite": 0}))
+
+        # Cache pricing incurs charges: must not be treated as free
+        self.assertFalse(bridge.is_model_free({"input": 0, "output": 0, "cacheRead": 0.5}))
+        self.assertFalse(bridge.is_model_free({"input": 0, "output": 0, "cacheWrite": 1.2}))
+
+        # Non-zero input/output or missing dimensions
+        self.assertFalse(bridge.is_model_free({"input": 1.0, "output": 2.0}))
+        self.assertFalse(bridge.is_model_free({"input": 0}))
+        self.assertFalse(bridge.is_model_free({}))
+        self.assertFalse(bridge.is_model_free(None))
+
+    def test_cors_headers_emitted_on_streaming_responses(self):
+        handler = Handler()
+        trusted_origin = "http://localhost:3000"
+        handler.headers = {"Origin": trusted_origin}
+
+        transport = OpenCodeTransport("http://127.0.0.1:9999")
+        conv = Conversation("tok1", "dir1", "m1", {}, None)
+        conv.events.put(("delta", {"content": "hello"}))
+        conv.events.put(("done", ({}, None)))
+
+        with patch.object(transport, "_resume", return_value=conv), \
+             patch.object(transport, "_client_disconnected", return_value=False), \
+             patch.object(transport, "_close"):
+            req = {"model": "m1", "messages": [{"role": "user", "content": "hi"}], "stream": True}
+            transport.chat(req, handler, [{"id": "m1", "provider": "opencode"}])
+
+        self.assertEqual(handler.status, 200)
+        self.assertEqual(handler.headers.get("Content-Type"), "text/event-stream; charset=utf-8")
+        self.assertEqual(handler.headers.get("Access-Control-Allow-Origin"), trusted_origin)
+        self.assertEqual(handler.headers.get("Vary"), "Origin")
+
     def test_image_data_url_attached_as_file_part_and_stripped_from_text_envelope(self):
         captured_payload = None
         def fake_run(conv, payload):

@@ -76,6 +76,18 @@ def model_cost(raw):
             and math.isfinite(value) and value >= 0}
 
 
+def is_model_free(cost):
+    """A model is free only when input and output prices are declared and zero,
+    and all other declared chargeable dimensions (cacheRead, cacheWrite) are zero."""
+    if not isinstance(cost, dict) or not cost:
+        return False
+    return (
+        cost.get("input") == 0
+        and cost.get("output") == 0
+        and all(val == 0 for val in cost.values())
+    )
+
+
 def discover_dynamic_models():
     """Runs `opencode models --verbose` and parses real-time models and live pricing."""
     models = []
@@ -113,15 +125,12 @@ def discover_dynamic_models():
                                 limit = raw.get("limit", {})
                                 caps = raw.get("capabilities", {})
 
-                                in_cost = cost.get("input")
-                                out_cost = cost.get("output")
-
                                 has_image = bool(caps.get("attachment", False))
                                 ctx = int(limit.get("context", 128000))
                                 max_out = int(limit.get("output", 8192))
 
                                 name = raw.get("name") or m_id
-                                is_free = (in_cost == 0.0 and out_cost == 0.0)
+                                is_free = is_model_free(cost)
                                 if is_free and "free" not in name.lower() and "free" not in m_id.lower():
                                     display_name = f"{name} (Free)"
                                 else:
@@ -180,8 +189,8 @@ def discover_dynamic_models():
                 })
 
     def sort_key(model):
-        cost = model["cost"]
-        explicitly_free = cost.get("input") == 0 and cost.get("output") == 0
+        cost = model.get("cost", {})
+        explicitly_free = is_model_free(cost)
         model["default_enabled"] = explicitly_free
         return (not explicitly_free, model["name"].casefold(), model["id"])
 
