@@ -177,8 +177,15 @@ describe('Bot candidate recovery', () => {
     // Native subscription routes without a custom providerId share account only if harness matches
     const currentSub = { harness: 'claude', providerId: null, agentDeviceId: null };
     expect(isSameAccountRoute({ harness: 'claude', providerId: null }, currentSub)).toBe(true);
+    expect(isSameAccountRoute({ harness: 'claude', providerId: 'anthropic' }, currentSub)).toBe(true);
     expect(isSameAccountRoute({ harness: 'codex', providerId: null }, currentSub)).toBe(false);
     expect(isSameAccountRoute({ harness: 'claude', providerId: 'openai' }, currentSub)).toBe(false);
+
+    // Implicit Codex OAuth routes (providerId: null) resolve to canonical 'openai'
+    const legacyCodex = { harness: 'codex', providerId: null, agentDeviceId: null };
+    expect(isSameAccountRoute({ harness: 'codex', providerId: 'openai' }, legacyCodex)).toBe(true);
+    expect(isSameAccountRoute({ harness: 'codex', providerId: null }, legacyCodex)).toBe(true);
+    expect(isSameAccountRoute({ harness: 'codex', providerId: 'other-provider' }, legacyCodex)).toBe(false);
 
     // Implicit Pi gateway aliases (null, xd, cindy) resolve to the same canonical provider account
     const piGateway = { harness: 'pi', providerId: null, agentDeviceId: null };
@@ -330,6 +337,14 @@ describe('Bot candidate recovery', () => {
       };
       expect(areCodexModelsInSameQuotaBucket('gpt-5.3-codex', 'gpt-5.1-codex', buckets)).toBe(true);
       expect(areCodexModelsInSameQuotaBucket('gpt-5.3-codex', 'gpt-5.3-codex-spark', buckets)).toBe(false);
+
+      // When the snapshot is incomplete (e.g. only generic 'codex' is cached because Spark has not run yet),
+      // Spark candidate must NOT fall back to sharing the generic bucket:
+      const onlyGenericBucket = {
+        codex: { limitId: 'codex', limitName: 'Codex' },
+      };
+      expect(areCodexModelsInSameQuotaBucket('gpt-5.3-codex', 'gpt-5.3-codex-spark', onlyGenericBucket)).toBe(false);
+      expect(areCodexModelsInSameQuotaBucket('gpt-5.3-codex', 'gpt-5.1-codex', onlyGenericBucket)).toBe(true);
     });
 
     it('preserves candidates in independent quota buckets when bucket quota is exhausted', () => {

@@ -49,11 +49,17 @@ export type AccountRoute = {
   agentDeviceId?: string | null;
 };
 
-/** Resolve implicit aliases (e.g. Pi null / xd / cindy gateway) to their canonical provider identity. */
+/** Resolve implicit aliases (e.g. Pi null / xd / cindy gateway; Codex null / openai under ChatGPT) to their canonical provider identity. */
 export function canonicalAccountProvider(route: AccountRoute): string | null {
   const provider = route.providerId ?? null;
   if (route.harness === 'pi' && (provider === null || provider === 'xd' || provider === 'cindy')) {
     return 'xd';
+  }
+  if (route.harness === 'codex' && (provider === null || provider === 'openai')) {
+    return 'openai';
+  }
+  if (route.harness === 'claude' && (provider === null || provider === 'anthropic')) {
+    return 'anthropic';
   }
   return provider;
 }
@@ -74,8 +80,8 @@ export function isSameAccountRoute(candidate: AccountRoute, current: AccountRout
 /**
  * Check whether two Codex models belong to the same quota bucket.
  * If live bucket snapshots are provided, compares authoritative limit IDs.
- * Otherwise, falls back to checking whether one model is a separate promotional bucket
- * (such as GPT-5.3-Codex-Spark) while the other belongs to the generic Codex bucket.
+ * When the snapshot is incomplete (e.g. only generic 'codex' bucket is cached because Spark
+ * has not run yet), retains the known rule that Spark runs in an independent promotional bucket.
  */
 export function areCodexModelsInSameQuotaBucket(
   currentModel: string | null | undefined,
@@ -83,6 +89,28 @@ export function areCodexModelsInSameQuotaBucket(
   buckets?: Record<string, BucketSnapshotLike> | null,
 ): boolean {
   if (currentModel && candidateModel && currentModel === candidateModel) return true;
+  const isSpark = (m: string | null | undefined) => Boolean(m && m.toLowerCase().includes('spark'));
+  const currentSpark = isSpark(currentModel);
+  const candidateSpark = isSpark(candidateModel);
+  if (currentSpark !== candidateSpark) {
+    // One model is Spark and one is standard:
+    // Only when the cached snapshot contains explicit evidence of a dedicated Spark bucket
+    // do we compare bucket keys; otherwise, the absence of an explicit Spark bucket in the snapshot
+    // simply means Spark hasn't run yet (app-server pushes one bucket at a time per usageBroadcaster:352-357).
+    if (buckets && Object.keys(buckets).length > 0) {
+      const sparkModel = currentSpark ? currentModel : candidateModel;
+      const otherModel = currentSpark ? candidateModel : currentModel;
+      const sparkBucket = matchCodexBucketForModel(buckets, sparkModel);
+      const otherBucket = matchCodexBucketForModel(buckets, otherModel);
+      const isSparkBucket = (b: BucketSnapshotLike | null) => Boolean(
+        b && (isSpark(b.limitName) || isSpark(b.limitId))
+      );
+      if (sparkBucket && otherBucket && isSparkBucket(sparkBucket)) {
+        return codexLimitBucketKey(sparkBucket) === codexLimitBucketKey(otherBucket);
+      }
+    }
+    return false;
+  }
   if (buckets && Object.keys(buckets).length > 0) {
     const currentBucket = matchCodexBucketForModel(buckets, currentModel);
     const candidateBucket = matchCodexBucketForModel(buckets, candidateModel);
@@ -90,8 +118,7 @@ export function areCodexModelsInSameQuotaBucket(
       return codexLimitBucketKey(currentBucket) === codexLimitBucketKey(candidateBucket);
     }
   }
-  const isSpark = (m: string | null | undefined) => Boolean(m && m.toLowerCase().includes('spark'));
-  return isSpark(currentModel) === isSpark(candidateModel);
+  return true;
 }
 
 /**
