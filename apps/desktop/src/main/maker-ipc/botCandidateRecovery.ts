@@ -1,6 +1,37 @@
 import { isNetworkishErrorMessage, isOverloadErrorMessage } from '@cindy/maker-core';
+import {
+  codexLimitBucketKey,
+  matchCodexBucketForModel,
+  type BucketSnapshotLike,
+} from '@cindy/maker-shared/codex-usage-buckets';
 import { matchesDeterministicUsageExhaustionText } from '@cindy/maker-shared/error-redaction';
 import type { InterruptedTurnErrorSignals } from './interruptedTurnAutoResume.js';
+
+export type UsageExhaustionScope = 'account' | 'bucket';
+
+/**
+ * Distinguish between account-wide exhaustion (billing/budget/account payment) and
+ * bucket-level quota limits (e.g. Codex app-server model-scoped limits).
+ */
+export function usageExhaustionScope(signals: InterruptedTurnErrorSignals): UsageExhaustionScope | null {
+  // Structured tags are authoritative:
+  // - Model-scoped rate limits on Codex app-server:
+  if (signals.codexErrorInfo === 'usageLimitExceeded') return 'bucket';
+  // - Account/budget-level exhaustion: every candidate on the same account fails the same way.
+  if (signals.codexErrorInfo === 'sessionBudgetExceeded' || signals.sdkError === 'billing_error') return 'account';
+  if (signals.errorStatus === 402) return 'account';
+  if (signals.sdkError === 'rate_limit' && typeof signals.usageResetAt === 'number') return 'account';
+  if (signals.sdkError && ['invalid_request', 'max_output_tokens'].includes(signals.sdkError)) return null;
+
+  // Text is only the fallback for untagged envelopes:
+  const message = signals.message ?? '';
+  const untagged = !signals.sdkError || signals.sdkError === 'unknown';
+  if (matchesDeterministicUsageExhaustionText(message) || (untagged && /\byou['’]ve hit your session limit\b/i.test(message))) {
+    return 'account';
+  }
+
+  return null;
+}
 
 /**
  * Account/budget exhaustion: every candidate on the same account fails the same way,
@@ -8,21 +39,15 @@ import type { InterruptedTurnErrorSignals } from './interruptedTurnAutoResume.js
  * authoritative; the shared deterministic text is the fallback for untagged envelopes.
  */
 export function isAccountUsageExhausted(signals: InterruptedTurnErrorSignals): boolean {
-  if (signals.codexErrorInfo === 'usageLimitExceeded' || signals.codexErrorInfo === 'sessionBudgetExceeded' || signals.sdkError === 'billing_error') return true;
-  // 402 Payment Required is account-level for every provider.
-  if (signals.errorStatus === 402) return true;
-  // Claude subscription limits carry a structured reset time from the SDK rate_limit_event.
-  if (signals.sdkError === 'rate_limit' && typeof signals.usageResetAt === 'number') return true;
-  // Explicit unretryable SDK tags must not be reclassified as account exhaustion from text.
-  if (signals.sdkError && ['invalid_request', 'max_output_tokens'].includes(signals.sdkError)) return false;
-  const message = signals.message ?? '';
-  // Untagged Claude session-limit envelopes; a known SDK tag must not be reclassified from text.
-  const untagged = !signals.sdkError || signals.sdkError === 'unknown';
-  return matchesDeterministicUsageExhaustionText(message)
-    || (untagged && /\byou['’]ve hit your session limit\b/i.test(message));
+  return usageExhaustionScope(signals) !== null;
 }
 
-export type AccountRoute = { harness: string; providerId?: string | null; agentDeviceId?: string | null };
+export type AccountRoute = {
+  harness: string;
+  model?: string | null;
+  providerId?: string | null;
+  agentDeviceId?: string | null;
+};
 
 /** Resolve implicit aliases (e.g. Pi null / xd / cindy gateway) to their canonical provider identity. */
 export function canonicalAccountProvider(route: AccountRoute): string | null {
@@ -44,6 +69,52 @@ export function isSameAccountRoute(candidate: AccountRoute, current: AccountRout
     return candidateProvider === currentProvider;
   }
   return candidate.harness === current.harness;
+}
+
+/**
+ * Check whether two Codex models belong to the same quota bucket.
+ * If live bucket snapshots are provided, compares authoritative limit IDs.
+ * Otherwise, falls back to checking whether one model is a separate promotional bucket
+ * (such as GPT-5.3-Codex-Spark) while the other belongs to the generic Codex bucket.
+ */
+export function areCodexModelsInSameQuotaBucket(
+  currentModel: string | null | undefined,
+  candidateModel: string | null | undefined,
+  buckets?: Record<string, BucketSnapshotLike> | null,
+): boolean {
+  if (currentModel && candidateModel && currentModel === candidateModel) return true;
+  if (buckets && Object.keys(buckets).length > 0) {
+    const currentBucket = matchCodexBucketForModel(buckets, currentModel);
+    const candidateBucket = matchCodexBucketForModel(buckets, candidateModel);
+    if (currentBucket && candidateBucket) {
+      return codexLimitBucketKey(currentBucket) === codexLimitBucketKey(candidateBucket);
+    }
+  }
+  const isSpark = (m: string | null | undefined) => Boolean(m && m.toLowerCase().includes('spark'));
+  return isSpark(currentModel) === isSpark(candidateModel);
+}
+
+/**
+ * Determine if a candidate route is exhausted given the failure scope of the current route.
+ * - Account-wide exhaustion (billing, session budget, 402, Claude subscription rate limit):
+ *   every candidate on the same account/device is exhausted.
+ * - Bucket-level exhaustion (Codex usageLimitExceeded):
+ *   candidates on the same Codex account that run in an independent quota bucket (e.g. Spark)
+ *   are preserved; candidates sharing the same bucket are excluded.
+ */
+export function isRouteExhaustedForCandidate(
+  candidate: AccountRoute,
+  current: AccountRoute,
+  scope: UsageExhaustionScope | null,
+  buckets?: Record<string, BucketSnapshotLike> | null,
+): boolean {
+  if (!scope) return false;
+  if (!isSameAccountRoute(candidate, current)) return false;
+  if (scope === 'account') return true;
+  if (candidate.harness === 'codex' && current.harness === 'codex') {
+    return areCodexModelsInSameQuotaBucket(current.model, candidate.model, buckets);
+  }
+  return true;
 }
 
 /** A failed provider may be replaced, even when retrying that provider is forbidden. */

@@ -1,7 +1,15 @@
 import { readFileSync } from 'node:fs';
 import { ScriptTarget, transpileModule } from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
-import { canResumeAfterRuntimeFallback, isAccountUsageExhausted, isBotCandidateUnavailable, isSameAccountRoute } from '../botCandidateRecovery';
+import {
+  areCodexModelsInSameQuotaBucket,
+  canResumeAfterRuntimeFallback,
+  isAccountUsageExhausted,
+  isBotCandidateUnavailable,
+  isRouteExhaustedForCandidate,
+  isSameAccountRoute,
+  usageExhaustionScope,
+} from '../botCandidateRecovery';
 import { isInterruptedTurnError, isAcceptedTurnContinuationOnlyReason } from '../interruptedTurnAutoResume';
 import { botModelRouteRuntimeKey, nextBotModelRoute } from '../../../shared/botModelChain';
 
@@ -21,6 +29,7 @@ function harness(bot = true) {
     episodeAttempt: 1, maxEpisodeAttempts: 10, sessionTotal: 1, attemptToken: 1, delayMs: 1000 }));
   const deps = {
     isInterruptedTurnError, isAccountUsageExhausted, isBotCandidateUnavailable, canResumeAfterRuntimeFallback,
+    usageExhaustionScope,
     isAcceptedTurnContinuationOnlyReason,
     inputCoordinator: { isExecutionPaused: () => false, autoRetryLastError: resume },
     interruptedTurnAutoResumeGuard: { onInterruptedTurn: guard, noteResumeSendFailed: vi.fn() },
@@ -67,7 +76,7 @@ describe('Bot candidate recovery', () => {
     expect(h.isResumableTurnErrorCandidate(signals, h.item)).toBe(true);
     expect(h.onResumableTurnError('s', signals, h.item)).not.toBeNull();
     await h.run();
-    expect(h.fallback).toHaveBeenCalledWith('s', 1, 1, true, expect.any(Function), true);
+    expect(h.fallback).toHaveBeenCalledWith('s', 1, 1, true, expect.any(Function), 'account');
     expect(h.resume).toHaveBeenCalledOnce();
   });
 
@@ -192,7 +201,17 @@ describe('Bot candidate recovery', () => {
     expect(h.isResumableTurnErrorCandidate(codexUsageLimit, h.item)).toBe(true);
     expect(h.onResumableTurnError('s', codexUsageLimit, h.item)).not.toBeNull();
     await h.run();
-    expect(h.fallback).toHaveBeenCalledWith('s', 1, 1, true, expect.any(Function), true);
+    expect(h.fallback).toHaveBeenCalledWith('s', 1, 1, true, expect.any(Function), 'bucket');
+    expect(h.resume).toHaveBeenCalledWith('s', 1);
+  });
+
+  it('passes account scope when billing or budget is exhausted', async () => {
+    const h = harness();
+    const billingError = { sdkError: 'billing_error', message: 'Billing error' };
+    expect(h.isResumableTurnErrorCandidate(billingError, h.item)).toBe(true);
+    expect(h.onResumableTurnError('s', billingError, h.item)).not.toBeNull();
+    await h.run();
+    expect(h.fallback).toHaveBeenCalledWith('s', 1, 1, true, expect.any(Function), 'account');
     expect(h.resume).toHaveBeenCalledWith('s', 1);
   });
 
@@ -283,5 +302,81 @@ describe('Bot candidate recovery', () => {
     // When B1 subsequently fails, recovery from B1 still remembers account A is exhausted and skips A2, selecting C1:
     const secondCandidate = nextBotModelRoute(chain, b1, visitedRoutes);
     expect(secondCandidate).toMatchObject(c1);
+  });
+
+  describe('Independent quota buckets preservation', () => {
+    it('distinguishes account-level exhaustion from model/bucket-level quota limits', () => {
+      expect(usageExhaustionScope({ codexErrorInfo: 'usageLimitExceeded' })).toBe('bucket');
+      expect(usageExhaustionScope({ codexErrorInfo: 'sessionBudgetExceeded' })).toBe('account');
+      expect(usageExhaustionScope({ sdkError: 'billing_error' })).toBe('account');
+      expect(usageExhaustionScope({ errorStatus: 402 })).toBe('account');
+      expect(usageExhaustionScope({ sdkError: 'rate_limit', usageResetAt: 1000 })).toBe('account');
+      expect(usageExhaustionScope({ message: 'budget_exceeded' })).toBe('account');
+      expect(usageExhaustionScope({ message: "You've hit your session limit" })).toBe('account');
+      expect(usageExhaustionScope({ sdkError: 'server_error' })).toBeNull();
+    });
+
+    it('identifies whether two Codex models belong to the same quota bucket', () => {
+      // Static heuristic: Spark models have an independent promotion bucket from standard models
+      expect(areCodexModelsInSameQuotaBucket('gpt-4o', 'gpt-5')).toBe(true);
+      expect(areCodexModelsInSameQuotaBucket('gpt-5.3-codex', 'gpt-5.1-codex')).toBe(true);
+      expect(areCodexModelsInSameQuotaBucket('gpt-5.3-codex', 'gpt-5.3-codex-spark')).toBe(false);
+      expect(areCodexModelsInSameQuotaBucket('spark-mini', 'gpt-5.3-codex-spark')).toBe(true);
+
+      // With authoritative app-server bucket snapshots:
+      const buckets = {
+        codex: { limitId: 'codex', limitName: 'Codex' },
+        codex_bengalfox: { limitId: 'codex_bengalfox', limitName: 'GPT-5.3-Codex-Spark' },
+      };
+      expect(areCodexModelsInSameQuotaBucket('gpt-5.3-codex', 'gpt-5.1-codex', buckets)).toBe(true);
+      expect(areCodexModelsInSameQuotaBucket('gpt-5.3-codex', 'gpt-5.3-codex-spark', buckets)).toBe(false);
+    });
+
+    it('preserves candidates in independent quota buckets when bucket quota is exhausted', () => {
+      const current = { harness: 'codex', model: 'gpt-5.3-codex', providerId: 'account-a', agentDeviceId: null };
+      const sameBucket = { harness: 'codex', model: 'gpt-5.1-codex', providerId: 'account-a', agentDeviceId: null };
+      const sparkCandidate = { harness: 'codex', model: 'gpt-5.3-codex-spark', providerId: 'account-a', agentDeviceId: null };
+      const diffAccount = { harness: 'codex', model: 'gpt-5.3-codex', providerId: 'account-b', agentDeviceId: null };
+
+      // Bucket scope (e.g. usageLimitExceeded):
+      // - Same bucket on same account is excluded
+      expect(isRouteExhaustedForCandidate(sameBucket, current, 'bucket')).toBe(true);
+      // - Spark on same account is preserved (independent bucket!)
+      expect(isRouteExhaustedForCandidate(sparkCandidate, current, 'bucket')).toBe(false);
+      // - Different account is preserved
+      expect(isRouteExhaustedForCandidate(diffAccount, current, 'bucket')).toBe(false);
+
+      // Account scope (e.g. sessionBudgetExceeded / 402):
+      // - Every candidate on the same account is excluded
+      expect(isRouteExhaustedForCandidate(sameBucket, current, 'account')).toBe(true);
+      expect(isRouteExhaustedForCandidate(sparkCandidate, current, 'account')).toBe(true);
+      // - Different account is still preserved
+      expect(isRouteExhaustedForCandidate(diffAccount, current, 'account')).toBe(false);
+    });
+
+    it('falls back to Spark candidate on the same account when primary model hits usageLimitExceeded', () => {
+      const standard = { harness: 'codex' as const, model: 'gpt-5.3-codex', providerId: 'account-a' };
+      const spark = { harness: 'codex' as const, model: 'gpt-5.3-codex-spark', providerId: 'account-a' };
+      const sonnet = { harness: 'claude' as const, model: 'sonnet-3-5', providerId: 'account-b' };
+      const chain = [standard, spark, sonnet];
+
+      // Standard hits usageLimitExceeded (scope: 'bucket') -> Spark is NOT skipped:
+      const fallbackForBucket = nextBotModelRoute(
+        chain,
+        standard,
+        [],
+        (candidate) => !isRouteExhaustedForCandidate(candidate, standard, 'bucket'),
+      );
+      expect(fallbackForBucket).toMatchObject(spark);
+
+      // Standard hits sessionBudgetExceeded / 402 (scope: 'account') -> entire account is skipped, falls back to Sonnet:
+      const fallbackForAccount = nextBotModelRoute(
+        chain,
+        standard,
+        [],
+        (candidate) => !isRouteExhaustedForCandidate(candidate, standard, 'account'),
+      );
+      expect(fallbackForAccount).toMatchObject(sonnet);
+    });
   });
 });

@@ -1488,6 +1488,9 @@ import {
   isSameAccountRoute,
   isBotCandidateUnavailable,
   canResumeAfterRuntimeFallback,
+  usageExhaustionScope,
+  isRouteExhaustedForCandidate,
+  type UsageExhaustionScope,
   type RuntimeFallbackResult,
 } from './botCandidateRecovery.js';
 
@@ -16826,7 +16829,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     sessionId: string,
     current: SessionRuntimeProfile,
     controlSessionId = sessionId,
-    excludeFailedAccount = false,
+    excludeFailedAccount: UsageExhaustionScope | boolean = false,
     expectedGeneration?: number,
   ): Promise<{ isBot: boolean; candidate: SessionRuntimeProfile | null }> => {
     const [row] = await getDbClient()
@@ -16876,11 +16879,29 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       : current.agentKind === 'pi'
         ? 'pi'
         : 'claude';
+    const scope: UsageExhaustionScope | null = typeof excludeFailedAccount === 'string'
+      ? excludeFailedAccount
+      : excludeFailedAccount ? 'account' : null;
+    const currentRoute = {
+      harness: currentHarness,
+      model: current.model,
+      providerId: current.providerId,
+      agentDeviceId: current.agentDeviceId,
+    };
+    let codexBuckets: Record<string, import('@cindy/maker-shared/codex-usage-buckets').BucketSnapshotLike> | null = null;
+    if (scope === 'bucket' && currentHarness === 'codex' && current.providerId) {
+      try {
+        const snap = await readCodexAccountUsageSnapshotWithWebRefresh(current.providerId).catch(() => null);
+        codexBuckets = snap?.appServerBuckets ?? null;
+      } catch {
+        codexBuckets = null;
+      }
+    }
     const control = getSessionRuntimeControlSnapshot(controlSessionId);
-    if (excludeFailedAccount) {
+    if (scope) {
       const targetGeneration = expectedGeneration ?? control.generation;
       const exhaustedKeys = chain
-        .filter((candidate) => isSameAccountRoute(candidate, { ...current, harness: currentHarness }))
+        .filter((candidate) => isRouteExhaustedForCandidate(candidate, currentRoute, scope, codexBuckets))
         .map(botModelRouteRuntimeKey);
       recordSkippedSessionRuntimeFallbackRoutes(controlSessionId, targetGeneration, exhaustedKeys);
     }
@@ -16889,10 +16910,10 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         .from(sessions).where(eq(sessions.id, controlSessionId)).limit(1);
     const route = nextBotModelRoute(
       chain,
-      { harness: currentHarness, model: current.model, providerId: current.providerId, agentDeviceId: current.agentDeviceId },
+      currentRoute,
       control.visitedRoutes,
       (candidate) => (!controlSession?.remoteHostId || candidate.harness === currentHarness) &&
-        !(excludeFailedAccount && isSameAccountRoute(candidate, { ...current, harness: currentHarness })),
+        !isRouteExhaustedForCandidate(candidate, currentRoute, scope, codexBuckets),
     );
     return {
       isBot: true,
@@ -16955,7 +16976,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     attemptToken: number,
     requireRouteChange = false,
     isCurrent: () => boolean = () => true,
-    excludeFailedAccount = false,
+    excludeFailedAccount: UsageExhaustionScope | boolean = false,
   ): Promise<RuntimeFallbackResult<Session>> => {
     const runtimeOwnerEpoch = captureSessionRuntimeControlOwnerEpoch();
     let runtimeSession: Session | null = null;
@@ -19792,7 +19813,8 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     ) => {
       if (!canRecoverTurn(signals, item) || inputCoordinator.isExecutionPaused(sessionId)) return null;
       const requireRouteChange = botFallbackInputs.has(item.createOpts) && isBotCandidateUnavailable(signals);
-      const excludeFailedAccount = requireRouteChange && isAccountUsageExhausted(signals);
+      const exhaustionScope = requireRouteChange ? usageExhaustionScope(signals) : null;
+      const excludeFailedAccount = exhaustionScope ?? false;
       const erroredAt = Date.now();
       const decision = interruptedTurnAutoResumeGuard.onInterruptedTurn(sessionId, erroredAt);
       if (decision.action !== 'resume') {
