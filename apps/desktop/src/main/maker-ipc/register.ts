@@ -16913,26 +16913,38 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         codexBuckets = null;
       }
     }
+    const providers = await getDesktopProviderService().listProviders({
+      allowSideEffects: false,
+      catalog: getActiveCatalog(),
+    }).catch(() => []);
+    const resolveDefaultProvider = (route: AccountRoute): string | null => {
+      if (route.providerId) return route.providerId;
+      return effectiveSourceIdForModel(
+        providers,
+        null,
+        route.model ?? '',
+        toAgentKind(route.harness),
+      );
+    };
     // Ask each configured fallback for its own model quota before choosing it.
     // shortcut: only routes using this computer's login are read; remote-device candidates keep the static rule.
     const liveLimits = new Map<string, { limited: boolean } | null | undefined>();
     if (!row.remoteHostId) {
       await Promise.all(chain.filter((candidate) => !candidate.agentDeviceId).map(async (candidate) => {
         liveLimits.set(botModelRouteRuntimeKey(candidate), await readAccountUsageLimit(
-          toAgentKind(candidate.harness), candidate.providerId, candidate.model,
+          toAgentKind(candidate.harness), resolveDefaultProvider(candidate), candidate.model,
         ).catch(() => undefined));
       }));
     }
     const isBlocked = (candidate: BotModelRoute) => isCandidateQuotaBlocked(
-      candidate, currentRoute, scope, liveLimits.get(botModelRouteRuntimeKey(candidate)), codexBuckets,
+      candidate, currentRoute, scope, liveLimits.get(botModelRouteRuntimeKey(candidate)), codexBuckets, resolveDefaultProvider,
     );
     const control = getSessionRuntimeControlSnapshot(controlSessionId);
-    if (scope || [...liveLimits.values()].some((limit) => limit?.limited)) {
-      const targetGeneration = expectedGeneration ?? control.generation;
+    if (scope && expectedGeneration !== undefined) {
       const exhaustedKeys = chain
         .filter(isBlocked)
         .map(botModelRouteRuntimeKey);
-      recordSkippedSessionRuntimeFallbackRoutes(controlSessionId, targetGeneration, exhaustedKeys);
+      recordSkippedSessionRuntimeFallbackRoutes(controlSessionId, expectedGeneration, exhaustedKeys);
     }
     const [controlSession] = controlSessionId === sessionId ? [{ remoteHostId: row.remoteHostId }]
       : await getDbClient().drizzle.select({ remoteHostId: sessions.remoteHostId })

@@ -421,8 +421,41 @@ describe('Live per-model quota for configured fallbacks', () => {
   const sameProviderOtherModel = { harness: 'claude', model: 'claude-sonnet-5-5', providerId: 'anthropic', agentDeviceId: null };
   const otherProvider = { harness: 'pi', model: 'argon-4', providerId: 'google-antigravity', agentDeviceId: null };
 
-  it('uses a same-provider model whose own quota is free, even after account-scope exhaustion', () => {
-    expect(isCandidateQuotaBlocked(sameProviderOtherModel, current, 'account', { limited: false })).toBe(false);
+  it('does not allow live quota to unblock an account-scope failure on the same provider', () => {
+    // 402 / billing_error / account budget affects all models on the account:
+    expect(isCandidateQuotaBlocked(sameProviderOtherModel, current, 'account', { limited: false })).toBe(true);
+  });
+
+  it('uses a same-provider model whose own quota is free when failure is bucket-scoped', () => {
+    expect(isCandidateQuotaBlocked(sameProviderOtherModel, current, 'bucket', { limited: false })).toBe(false);
+  });
+
+  it('does not let fallback generic bucket block Spark candidate when bucket snapshot is incomplete', () => {
+    const codexCurrent = { harness: 'codex', model: 'gpt-5.3-codex', providerId: 'openai', agentDeviceId: null };
+    const sparkCandidate = { harness: 'codex', model: 'gpt-5.3-codex-spark', providerId: 'openai', agentDeviceId: null };
+    const onlyGenericBuckets = { codex: { limitId: 'codex', limitName: 'Codex' } };
+    // Even if readAccountUsageLimit fell back to the generic bucket and returned { limited: true }:
+    expect(isCandidateQuotaBlocked(sparkCandidate, codexCurrent, 'bucket', { limited: true }, onlyGenericBuckets)).toBe(false);
+
+    // But if dedicated Spark bucket snapshot is present and reports limited:
+    const bucketsWithSpark = {
+      codex: { limitId: 'codex', limitName: 'Codex' },
+      codex_bengalfox: { limitId: 'codex_bengalfox', limitName: 'GPT-5.3-Codex-Spark' },
+    };
+    expect(isCandidateQuotaBlocked(sparkCandidate, codexCurrent, 'bucket', { limited: true }, bucketsWithSpark)).toBe(true);
+  });
+
+  it('resolves implicit Claude candidate to actual default provider instead of assuming anthropic', () => {
+    const currentXd = { harness: 'claude', model: 'sonnet-3-5', providerId: 'xd', agentDeviceId: null };
+    const implicitClaude = { harness: 'claude', model: 'sonnet-3-5', providerId: null, agentDeviceId: null };
+    const explicitAnthropic = { harness: 'claude', model: 'sonnet-3-5', providerId: 'anthropic', agentDeviceId: null };
+
+    // When default resolver indicates xd is the effective default:
+    const resolveDefault = () => 'xd';
+    // Implicit Claude matches xd:
+    expect(isSameAccountRoute(implicitClaude, currentXd, resolveDefault)).toBe(true);
+    // Explicit Anthropic does NOT match xd:
+    expect(isSameAccountRoute(explicitAnthropic, currentXd, resolveDefault)).toBe(false);
   });
 
   it('skips a candidate whose own quota is limited, even on another provider', () => {
@@ -436,7 +469,7 @@ describe('Live per-model quota for configured fallbacks', () => {
     expect(isCandidateQuotaBlocked(otherProvider, current, 'account', undefined)).toBe(false);
   });
 
-  it('walks the chain to the first candidate whose quota is free', () => {
+  it('walks the chain to the first candidate whose quota is free on bucket-scope exhaustion', () => {
     const chain = [
       { ...current },
       { ...sameProviderOtherModel },
@@ -447,7 +480,7 @@ describe('Live per-model quota for configured fallbacks', () => {
       [botModelRouteRuntimeKey(chain[2]), { limited: false }],
     ]);
     const next = nextBotModelRoute(chain, current as BotModelRoute, [],
-      (c) => !isCandidateQuotaBlocked(c, current, 'account', live.get(botModelRouteRuntimeKey(c))));
+      (c) => !isCandidateQuotaBlocked(c, current, 'bucket', live.get(botModelRouteRuntimeKey(c))));
     expect(next?.model).toBe('claude-haiku-5-5');
   });
 });

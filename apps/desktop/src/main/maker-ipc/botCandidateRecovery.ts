@@ -50,27 +50,34 @@ export type AccountRoute = {
 };
 
 /** Resolve implicit aliases (e.g. Pi null / xd / cindy gateway; Codex null / openai under ChatGPT) to their canonical provider identity. */
-export function canonicalAccountProvider(route: AccountRoute): string | null {
-  const provider = route.providerId ?? null;
+export function canonicalAccountProvider(
+  route: AccountRoute,
+  resolveDefault?: (route: AccountRoute) => string | null,
+): string | null {
+  const provider = route.providerId ?? resolveDefault?.(route) ?? null;
   if (route.harness === 'pi' && (provider === null || provider === 'xd' || provider === 'cindy')) {
     return 'xd';
   }
   if (route.harness === 'codex' && (provider === null || provider === 'openai')) {
     return 'openai';
   }
-  if (route.harness === 'claude' && (provider === null || provider === 'anthropic')) {
-    return 'anthropic';
+  if (route.harness === 'claude' && provider === null) {
+    return resolveDefault ? (resolveDefault(route) ?? 'anthropic') : 'anthropic';
   }
   return provider;
 }
 
 /** Same harness, source and device: an exhausted account cannot be recovered by this route. */
-export function isSameAccountRoute(candidate: AccountRoute, current: AccountRoute): boolean {
+export function isSameAccountRoute(
+  candidate: AccountRoute,
+  current: AccountRoute,
+  resolveDefault?: (route: AccountRoute) => string | null,
+): boolean {
   if ((candidate.agentDeviceId ?? null) !== (current.agentDeviceId ?? null)) {
     return false;
   }
-  const candidateProvider = canonicalAccountProvider(candidate);
-  const currentProvider = canonicalAccountProvider(current);
+  const candidateProvider = canonicalAccountProvider(candidate, resolveDefault);
+  const currentProvider = canonicalAccountProvider(current, resolveDefault);
   if (candidateProvider !== null || currentProvider !== null) {
     return candidateProvider === currentProvider;
   }
@@ -136,9 +143,10 @@ export function isRouteExhaustedForCandidate(
   current: AccountRoute,
   scope: UsageExhaustionScope | null,
   buckets?: Record<string, BucketSnapshotLike> | null,
+  resolveDefaultProvider?: (route: AccountRoute) => string | null,
 ): boolean {
   if (!scope) return false;
-  if (!isSameAccountRoute(candidate, current)) return false;
+  if (!isSameAccountRoute(candidate, current, resolveDefaultProvider)) return false;
   if (scope === 'account') return true;
   if (candidate.harness !== current.harness) {
     return false;
@@ -150,10 +158,15 @@ export function isRouteExhaustedForCandidate(
 }
 
 /**
- * Live per-model usage beats the static same-account rule: a candidate whose own quota is
- * known to be free is eligible even on the failed provider (separate Gemini / Anthropic model
- * limits), and one known to be limited is skipped even on another provider.
- * `undefined` / `null` (no reader for this provider, or no snapshot yet) keeps the static rule.
+ * Live per-model usage checks candidate eligibility without overriding established failure scopes:
+ * 1. Account-wide exhaustion (billing_error, 402, session budget) strictly excludes all candidates
+ *    on that same account; live quota snapshots cannot revive an account with payment/budget failures.
+ * 2. If the current failure already exhausts the candidate's route (same bucket, same account),
+ *    the candidate is blocked.
+ * 3. A candidate on any provider known to be limited by its own live quota is blocked, EXCEPT when
+ *    a Codex candidate in an independent promotional bucket (Spark) only has inherited/generic bucket
+ *    data in the cached snapshot (which falsely marks it limited).
+ * 4. Otherwise, falls back to static route exhaustion rules.
  */
 export function isCandidateQuotaBlocked(
   candidate: AccountRoute,
@@ -161,9 +174,42 @@ export function isCandidateQuotaBlocked(
   scope: UsageExhaustionScope | null,
   liveLimit: { limited: boolean } | null | undefined,
   buckets?: Record<string, BucketSnapshotLike> | null,
+  resolveDefaultProvider?: (route: AccountRoute) => string | null,
 ): boolean {
-  if (liveLimit) return liveLimit.limited;
-  return isRouteExhaustedForCandidate(candidate, current, scope, buckets);
+  // 1. Account-wide exhaustion (402, billing_error, session budget) strictly excludes all
+  //    candidates on that same account; live quota snapshots cannot revive an account with payment failures.
+  if (scope === 'account' && isSameAccountRoute(candidate, current, resolveDefaultProvider)) {
+    return true;
+  }
+  // 2. If a live quota snapshot is available for this candidate:
+  if (liveLimit) {
+    if (liveLimit.limited) {
+      // If live limit says limited, check whether this limit is reliable:
+      // An incomplete Codex bucket table without dedicated Spark evidence will falsely match Spark
+      // to the exhausted generic bucket. Do not let that fallback bucket block Spark.
+      const isSpark = (m: string | null | undefined) => Boolean(m && m.toLowerCase().includes('spark'));
+      if (candidate.harness === 'codex' && isSpark(candidate.model)) {
+        const hasDedicatedSparkBucket = Boolean(
+          buckets && Object.values(buckets).some((b) => isSpark(b.limitName) || isSpark(b.limitId)),
+        );
+        if (!hasDedicatedSparkBucket) {
+          return false;
+        }
+      }
+      return true;
+    }
+    // liveLimit is { limited: false }:
+    // For bucket-scope failures on the same provider (e.g. separate model buckets on Anthropic/Gemini/Argon),
+    // a model whose own live quota is free is eligible, unless static rules prove it shares the same Codex bucket:
+    if (candidate.harness === 'codex' && current.harness === 'codex' && isSameAccountRoute(candidate, current, resolveDefaultProvider)) {
+      if (areCodexModelsInSameQuotaBucket(current.model, candidate.model, buckets)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  // 3. Without live quota data, fall back to static route exhaustion rules:
+  return isRouteExhaustedForCandidate(candidate, current, scope, buckets, resolveDefaultProvider);
 }
 
 /** A failed provider may be replaced, even when retrying that provider is forbidden. */
