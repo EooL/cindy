@@ -6,12 +6,13 @@ import {
   canResumeAfterRuntimeFallback,
   isAccountUsageExhausted,
   isBotCandidateUnavailable,
+  isCandidateQuotaBlocked,
   isRouteExhaustedForCandidate,
   isSameAccountRoute,
   usageExhaustionScope,
 } from '../botCandidateRecovery';
 import { isInterruptedTurnError, isAcceptedTurnContinuationOnlyReason } from '../interruptedTurnAutoResume';
-import { botModelRouteRuntimeKey, nextBotModelRoute } from '../../../shared/botModelChain';
+import { botModelRouteRuntimeKey, nextBotModelRoute, type BotModelRoute } from '../../../shared/botModelChain';
 
 const source = readFileSync(new URL('../register.ts', import.meta.url), 'utf8');
 
@@ -412,5 +413,41 @@ describe('Bot candidate recovery', () => {
       expect(isRouteExhaustedForCandidate(piBridge, codexCurrent, 'account')).toBe(true);
       expect(isRouteExhaustedForCandidate(claudeBridge, codexCurrent, 'account')).toBe(true);
     });
+  });
+});
+
+describe('Live per-model quota for configured fallbacks', () => {
+  const current = { harness: 'claude', model: 'claude-opus-5-5', providerId: 'anthropic', agentDeviceId: null };
+  const sameProviderOtherModel = { harness: 'claude', model: 'claude-sonnet-5-5', providerId: 'anthropic', agentDeviceId: null };
+  const otherProvider = { harness: 'pi', model: 'argon-4', providerId: 'google-antigravity', agentDeviceId: null };
+
+  it('uses a same-provider model whose own quota is free, even after account-scope exhaustion', () => {
+    expect(isCandidateQuotaBlocked(sameProviderOtherModel, current, 'account', { limited: false })).toBe(false);
+  });
+
+  it('skips a candidate whose own quota is limited, even on another provider', () => {
+    expect(isCandidateQuotaBlocked(otherProvider, current, 'account', { limited: true })).toBe(true);
+    expect(isCandidateQuotaBlocked(otherProvider, current, null, { limited: true })).toBe(true);
+  });
+
+  it('keeps the static same-account rule when no live quota is known', () => {
+    expect(isCandidateQuotaBlocked(sameProviderOtherModel, current, 'account', undefined)).toBe(true);
+    expect(isCandidateQuotaBlocked(sameProviderOtherModel, current, 'account', null)).toBe(true);
+    expect(isCandidateQuotaBlocked(otherProvider, current, 'account', undefined)).toBe(false);
+  });
+
+  it('walks the chain to the first candidate whose quota is free', () => {
+    const chain = [
+      { ...current },
+      { ...sameProviderOtherModel },
+      { harness: 'claude', model: 'claude-haiku-5-5', providerId: 'anthropic', agentDeviceId: null },
+    ] as BotModelRoute[];
+    const live = new Map([
+      [botModelRouteRuntimeKey(chain[1]), { limited: true }],
+      [botModelRouteRuntimeKey(chain[2]), { limited: false }],
+    ]);
+    const next = nextBotModelRoute(chain, current as BotModelRoute, [],
+      (c) => !isCandidateQuotaBlocked(c, current, 'account', live.get(botModelRouteRuntimeKey(c))));
+    expect(next?.model).toBe('claude-haiku-5-5');
   });
 });

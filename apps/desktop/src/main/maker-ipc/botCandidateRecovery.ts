@@ -149,6 +149,23 @@ export function isRouteExhaustedForCandidate(
   return true;
 }
 
+/**
+ * Live per-model usage beats the static same-account rule: a candidate whose own quota is
+ * known to be free is eligible even on the failed provider (separate Gemini / Anthropic model
+ * limits), and one known to be limited is skipped even on another provider.
+ * `undefined` / `null` (no reader for this provider, or no snapshot yet) keeps the static rule.
+ */
+export function isCandidateQuotaBlocked(
+  candidate: AccountRoute,
+  current: AccountRoute,
+  scope: UsageExhaustionScope | null,
+  liveLimit: { limited: boolean } | null | undefined,
+  buckets?: Record<string, BucketSnapshotLike> | null,
+): boolean {
+  if (liveLimit) return liveLimit.limited;
+  return isRouteExhaustedForCandidate(candidate, current, scope, buckets);
+}
+
 /** A failed provider may be replaced, even when retrying that provider is forbidden. */
 export function isBotCandidateUnavailable(signals: InterruptedTurnErrorSignals): boolean {
   const reason = signals.reason ?? '';

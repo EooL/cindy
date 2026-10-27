@@ -1490,6 +1490,7 @@ import {
   canResumeAfterRuntimeFallback,
   usageExhaustionScope,
   isRouteExhaustedForCandidate,
+  isCandidateQuotaBlocked,
   type UsageExhaustionScope,
   type RuntimeFallbackResult,
 } from './botCandidateRecovery.js';
@@ -16912,11 +16913,24 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         codexBuckets = null;
       }
     }
+    // Ask each configured fallback for its own model quota before choosing it.
+    // shortcut: only routes using this computer's login are read; remote-device candidates keep the static rule.
+    const liveLimits = new Map<string, { limited: boolean } | null | undefined>();
+    if (!row.remoteHostId) {
+      await Promise.all(chain.filter((candidate) => !candidate.agentDeviceId).map(async (candidate) => {
+        liveLimits.set(botModelRouteRuntimeKey(candidate), await readAccountUsageLimit(
+          toAgentKind(candidate.harness), candidate.providerId, candidate.model,
+        ).catch(() => undefined));
+      }));
+    }
+    const isBlocked = (candidate: BotModelRoute) => isCandidateQuotaBlocked(
+      candidate, currentRoute, scope, liveLimits.get(botModelRouteRuntimeKey(candidate)), codexBuckets,
+    );
     const control = getSessionRuntimeControlSnapshot(controlSessionId);
-    if (scope) {
+    if (scope || [...liveLimits.values()].some((limit) => limit?.limited)) {
       const targetGeneration = expectedGeneration ?? control.generation;
       const exhaustedKeys = chain
-        .filter((candidate) => isRouteExhaustedForCandidate(candidate, currentRoute, scope, codexBuckets))
+        .filter(isBlocked)
         .map(botModelRouteRuntimeKey);
       recordSkippedSessionRuntimeFallbackRoutes(controlSessionId, targetGeneration, exhaustedKeys);
     }
@@ -16928,7 +16942,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       currentRoute,
       control.visitedRoutes,
       (candidate) => (!controlSession?.remoteHostId || candidate.harness === currentHarness) &&
-        !isRouteExhaustedForCandidate(candidate, currentRoute, scope, codexBuckets),
+        !isBlocked(candidate),
     );
     return {
       isBot: true,
