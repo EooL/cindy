@@ -11,13 +11,13 @@ export type UsageExhaustionScope = 'account' | 'bucket';
 
 /**
  * Distinguish between account-wide exhaustion (billing/budget/account payment) and
- * bucket-level quota limits (e.g. Codex app-server model-scoped limits).
+ * bucket-level quota limits (e.g. Codex app-server model-scoped limits, model quota pools).
  */
 export function usageExhaustionScope(signals: InterruptedTurnErrorSignals): UsageExhaustionScope | null {
   // Structured tags are authoritative:
   // - Model-scoped rate limits on Codex app-server:
   if (signals.codexErrorInfo === 'usageLimitExceeded') return 'bucket';
-  // - Account/budget-level exhaustion: every candidate on the same account fails the same way.
+  // - Explicit account/budget-level exhaustion: every candidate on the same account fails the same way.
   if (signals.codexErrorInfo === 'sessionBudgetExceeded' || signals.sdkError === 'billing_error') return 'account';
   if (signals.errorStatus === 402) return 'account';
   if (signals.sdkError === 'rate_limit' && typeof signals.usageResetAt === 'number') return 'account';
@@ -26,8 +26,21 @@ export function usageExhaustionScope(signals: InterruptedTurnErrorSignals): Usag
   // Text is only the fallback for untagged envelopes:
   const message = signals.message ?? '';
   const untagged = !signals.sdkError || signals.sdkError === 'unknown';
-  if (matchesDeterministicUsageExhaustionText(message) || (untagged && /\byou['’]ve hit your session limit\b/i.test(message))) {
-    return 'account';
+
+  // Explicit account/billing balance exhaustion:
+  const isAccountWideText =
+    /\b(?:exceeded[-_]?budget|budget[-_]?exceeded)\b/i.test(message) ||
+    /\b(?:account|session)\s+budget\b.{0,16}\b(?:exhausted|exceeded)\b/i.test(message) ||
+    /\binsufficient.{0,12}\b(?:balance|credit|funds)\b/i.test(message) ||
+    /\bspend(?:ing)?[-_ ]?cap\b/i.test(message) ||
+    /余额不足|欠费/i.test(message) ||
+    (untagged && /\byou['’]ve hit your session limit\b/i.test(message));
+
+  if (isAccountWideText) return 'account';
+
+  // Ambiguous quota/usage limit text (model-level or pool-level limits, e.g. "quota exceeded"):
+  if (matchesDeterministicUsageExhaustionText(message)) {
+    return 'bucket';
   }
 
   return null;
@@ -175,6 +188,7 @@ export function isCandidateQuotaBlocked(
   liveLimit: { limited: boolean } | null | undefined,
   buckets?: Record<string, BucketSnapshotLike> | null,
   resolveDefaultProvider?: (route: AccountRoute) => string | null,
+  candidateBuckets?: Record<string, BucketSnapshotLike> | null,
 ): boolean {
   // 1. Account-wide exhaustion (402, billing_error, session budget) strictly excludes all
   //    candidates on that same account; live quota snapshots cannot revive an account with payment failures.
@@ -184,16 +198,20 @@ export function isCandidateQuotaBlocked(
   // 2. If a live quota snapshot is available for this candidate:
   if (liveLimit) {
     if (liveLimit.limited) {
-      // If live limit says limited, check whether this limit is reliable:
-      // An incomplete Codex bucket table without dedicated Spark evidence will falsely match Spark
-      // to the exhausted generic bucket. Do not let that fallback bucket block Spark.
+      // Check whether this limited result is a false positive from an incomplete generic bucket table:
+      // Only waive when candidate is on the same account as the current failure AND has no dedicated bucket in targetBuckets.
+      // A candidate on a separate account (or with proven dedicated Spark bucket) must not have its limit waived by another account's incomplete snapshot.
       const isSpark = (m: string | null | undefined) => Boolean(m && m.toLowerCase().includes('spark'));
       if (candidate.harness === 'codex' && isSpark(candidate.model)) {
-        const hasDedicatedSparkBucket = Boolean(
-          buckets && Object.values(buckets).some((b) => isSpark(b.limitName) || isSpark(b.limitId)),
-        );
-        if (!hasDedicatedSparkBucket) {
-          return false;
+        const isSameAccount = isSameAccountRoute(candidate, current, resolveDefaultProvider);
+        if (isSameAccount) {
+          const targetBuckets = candidateBuckets ?? buckets;
+          const hasDedicatedSparkBucket = Boolean(
+            targetBuckets && Object.values(targetBuckets).some((b) => isSpark(b.limitName) || isSpark(b.limitId)),
+          );
+          if (!hasDedicatedSparkBucket) {
+            return false;
+          }
         }
       }
       return true;

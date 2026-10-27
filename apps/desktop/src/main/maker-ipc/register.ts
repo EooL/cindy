@@ -16929,15 +16929,28 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     // Ask each configured fallback for its own model quota before choosing it.
     // shortcut: only routes using this computer's login are read; remote-device candidates keep the static rule.
     const liveLimits = new Map<string, { limited: boolean } | null | undefined>();
+    const candidateBuckets = new Map<string, Record<string, import('@cindy/maker-shared/codex-usage-buckets').BucketSnapshotLike> | null>();
     if (!row.remoteHostId) {
       await Promise.all(chain.filter((candidate) => !candidate.agentDeviceId).map(async (candidate) => {
-        liveLimits.set(botModelRouteRuntimeKey(candidate), await readAccountUsageLimit(
-          toAgentKind(candidate.harness), resolveDefaultProvider(candidate), candidate.model,
+        const key = botModelRouteRuntimeKey(candidate);
+        const providerId = resolveDefaultProvider(candidate);
+        liveLimits.set(key, await readAccountUsageLimit(
+          toAgentKind(candidate.harness), providerId, candidate.model,
         ).catch(() => undefined));
+        if (candidate.harness === 'codex' && providerId) {
+          const snap = await readCodexAccountUsageSnapshot(providerId).catch(() => null);
+          candidateBuckets.set(key, snap?.appServerBuckets ?? null);
+        }
       }));
     }
     const isBlocked = (candidate: BotModelRoute) => isCandidateQuotaBlocked(
-      candidate, currentRoute, scope, liveLimits.get(botModelRouteRuntimeKey(candidate)), codexBuckets, resolveDefaultProvider,
+      candidate,
+      currentRoute,
+      scope,
+      liveLimits.get(botModelRouteRuntimeKey(candidate)),
+      codexBuckets,
+      resolveDefaultProvider,
+      candidateBuckets.get(botModelRouteRuntimeKey(candidate)),
     );
     const control = getSessionRuntimeControlSnapshot(controlSessionId);
     if (scope && expectedGeneration !== undefined) {

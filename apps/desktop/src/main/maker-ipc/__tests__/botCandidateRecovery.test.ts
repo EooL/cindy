@@ -320,6 +320,14 @@ describe('Bot candidate recovery', () => {
       expect(usageExhaustionScope({ errorStatus: 402 })).toBe('account');
       expect(usageExhaustionScope({ sdkError: 'rate_limit', usageResetAt: 1000 })).toBe('account');
       expect(usageExhaustionScope({ message: 'budget_exceeded' })).toBe('account');
+      expect(usageExhaustionScope({ message: 'exceeded_budget' })).toBe('account');
+      expect(usageExhaustionScope({ message: 'insufficient balance' })).toBe('account');
+      expect(usageExhaustionScope({ message: 'insufficient funds' })).toBe('account');
+      expect(usageExhaustionScope({ message: 'spend cap reached' })).toBe('account');
+      expect(usageExhaustionScope({ message: '余额不足' })).toBe('account');
+      expect(usageExhaustionScope({ message: 'quota exceeded' })).toBe('bucket');
+      expect(usageExhaustionScope({ message: 'insufficient_quota' })).toBe('bucket');
+      expect(usageExhaustionScope({ message: "You've hit your usage limit" })).toBe('bucket');
       expect(usageExhaustionScope({ message: "You've hit your session limit" })).toBe('account');
       expect(usageExhaustionScope({ sdkError: 'server_error' })).toBeNull();
     });
@@ -443,6 +451,22 @@ describe('Live per-model quota for configured fallbacks', () => {
       codex_bengalfox: { limitId: 'codex_bengalfox', limitName: 'GPT-5.3-Codex-Spark' },
     };
     expect(isCandidateQuotaBlocked(sparkCandidate, codexCurrent, 'bucket', { limited: true }, bucketsWithSpark)).toBe(true);
+
+    // Cross-account Spark candidate: Account A's generic bucket snapshot must NOT waive Account B's own limited reading:
+    const sparkCandidateAccountB = { harness: 'codex', model: 'gpt-5.3-codex-spark', providerId: 'openai-b', agentDeviceId: null };
+    expect(isCandidateQuotaBlocked(sparkCandidateAccountB, codexCurrent, 'bucket', { limited: true }, onlyGenericBuckets)).toBe(true);
+
+    // When candidateBuckets is explicitly provided for candidate account, it is respected:
+    expect(isCandidateQuotaBlocked(sparkCandidate, codexCurrent, 'bucket', { limited: true }, onlyGenericBuckets, undefined, bucketsWithSpark)).toBe(true);
+  });
+
+  it('preserves usable model candidates when local multi-model provider hits quota exceeded on a specific model', () => {
+    const argonCurrent = { harness: 'pi', model: 'argon-4', providerId: 'google-antigravity', agentDeviceId: null };
+    const geminiCandidate = { harness: 'pi', model: 'gemini-2.5-pro', providerId: 'google-antigravity', agentDeviceId: null };
+    const scope = usageExhaustionScope({ message: 'quota exceeded' });
+    expect(scope).toBe('bucket');
+    // Gemini candidate on the same provider has free quota:
+    expect(isCandidateQuotaBlocked(geminiCandidate, argonCurrent, scope, { limited: false })).toBe(false);
   });
 
   it('resolves implicit Claude candidate to actual default provider instead of assuming anthropic', () => {
