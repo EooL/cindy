@@ -99,8 +99,10 @@ export function areCodexModelsInSameQuotaBucket(
  * - Account-wide exhaustion (billing, session budget, 402, Claude subscription rate limit):
  *   every candidate on the same account/device is exhausted.
  * - Bucket-level exhaustion (Codex usageLimitExceeded):
- *   candidates on the same Codex account that run in an independent quota bucket (e.g. Spark)
- *   are preserved; candidates sharing the same bucket are excluded.
+ *   1. Cross-harness routes on the same account (e.g. Codex app-server vs Pi / Claude Code WHAM bridge)
+ *      use independent quota pools (accountUsageLimit:44-63), so the bridge candidate remains eligible.
+ *   2. Same-harness routes on the same Codex account running in an independent quota bucket (e.g. Spark)
+ *      are preserved; only candidates sharing the same bucket are excluded.
  */
 export function isRouteExhaustedForCandidate(
   candidate: AccountRoute,
@@ -111,6 +113,9 @@ export function isRouteExhaustedForCandidate(
   if (!scope) return false;
   if (!isSameAccountRoute(candidate, current)) return false;
   if (scope === 'account') return true;
+  if (candidate.harness !== current.harness) {
+    return false;
+  }
   if (candidate.harness === 'codex' && current.harness === 'codex') {
     return areCodexModelsInSameQuotaBucket(current.model, candidate.model, buckets);
   }

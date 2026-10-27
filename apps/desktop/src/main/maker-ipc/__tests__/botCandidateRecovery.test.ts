@@ -378,5 +378,24 @@ describe('Bot candidate recovery', () => {
       );
       expect(fallbackForAccount).toMatchObject(sonnet);
     });
+
+    it('preserves cross-harness bridge candidates on the same account during bucket exhaustion', () => {
+      // Under ChatGPT subscriptions, native Codex uses app-server buckets, while Pi / Claude Code
+      // bridges consume the WHAM webSnapshot pool (accountUsageLimit:44-63).
+      const codexCurrent = { harness: 'codex' as const, model: 'gpt-5.3-codex', providerId: 'account-openai' };
+      const piBridge = { harness: 'pi' as const, model: 'gpt-4o', providerId: 'account-openai' };
+      const claudeBridge = { harness: 'claude' as const, model: 'claude-3-5-sonnet', providerId: 'account-openai' };
+      const codexSameBucket = { harness: 'codex' as const, model: 'gpt-5.1-codex', providerId: 'account-openai' };
+
+      // Bucket scope: cross-harness candidates remain eligible, same harness & bucket is excluded
+      expect(isRouteExhaustedForCandidate(codexSameBucket, codexCurrent, 'bucket')).toBe(true);
+      expect(isRouteExhaustedForCandidate(piBridge, codexCurrent, 'bucket')).toBe(false);
+      expect(isRouteExhaustedForCandidate(claudeBridge, codexCurrent, 'bucket')).toBe(false);
+
+      // Account scope: everything on the same account is excluded
+      expect(isRouteExhaustedForCandidate(codexSameBucket, codexCurrent, 'account')).toBe(true);
+      expect(isRouteExhaustedForCandidate(piBridge, codexCurrent, 'account')).toBe(true);
+      expect(isRouteExhaustedForCandidate(claudeBridge, codexCurrent, 'account')).toBe(true);
+    });
   });
 });

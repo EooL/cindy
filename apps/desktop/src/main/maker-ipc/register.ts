@@ -137,7 +137,7 @@ import { resolveBotAuthorizationDelivery, buildBotAuthorizationContinuation, com
 import { registerSessionSetModelHandler } from './sessionSetModelHandler.js';
 import { refreshSubscriptionAccountModels } from '../maker-host/subscription-account-models.js';
 import { syncSubscriptionAccountUsage } from '../usage/subscriptionAccountUsage.js';
-import { clearXaiRateLimitSnapshot } from '../usageBroadcaster.js';
+import { clearXaiRateLimitSnapshot, readCodexAccountUsageSnapshot } from '../usageBroadcaster.js';
 import { subscriptionAccountKind, subscriptionAccountState, loginSubscriptionAccount, logoutSubscriptionAccount, cancelSubscriptionAccountLogin, removeSubscriptionAccountCredentialsReversibly } from '../maker-host/subscription-account-auth.js';
 import { isCodexAccountProvider, codexAccountState, codexAccountLoginName, loginCodexAccount, logoutCodexAccount, cancelCodexAccountLogin, removeCodexAccountCredentialsReversibly, retireCodexAccount } from '../maker-host/codex-account-auth.js';
 import { projectRemoteBotDelegations } from './remoteBotDelegations.js';
@@ -16874,7 +16874,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     const chain = await readEffectiveBotModelChain(config);
     const toAgentKind = (harness: string): AgentKind =>
       harness === 'codex' ? 'codex' : harness === 'pi' ? 'pi' : 'claude-code';
-    const currentHarness = current.agentKind === 'codex'
+    const currentHarness: 'codex' | 'pi' | 'claude' = current.agentKind === 'codex'
       ? 'codex'
       : current.agentKind === 'pi'
         ? 'pi'
@@ -16882,17 +16882,32 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     const scope: UsageExhaustionScope | null = typeof excludeFailedAccount === 'string'
       ? excludeFailedAccount
       : excludeFailedAccount ? 'account' : null;
-    const currentRoute = {
+    const currentRoute: {
+      harness: 'codex' | 'pi' | 'claude';
+      model: string;
+      providerId: string | null;
+      agentDeviceId: string | null | undefined;
+    } = {
       harness: currentHarness,
       model: current.model,
       providerId: current.providerId,
       agentDeviceId: current.agentDeviceId,
     };
     let codexBuckets: Record<string, import('@cindy/maker-shared/codex-usage-buckets').BucketSnapshotLike> | null = null;
-    if (scope === 'bucket' && currentHarness === 'codex' && current.providerId) {
+    if (scope === 'bucket' && currentHarness === 'codex' && current.providerId && !row.remoteHostId) {
       try {
-        const snap = await readCodexAccountUsageSnapshotWithWebRefresh(current.providerId).catch(() => null);
-        codexBuckets = snap?.appServerBuckets ?? null;
+        if (current.agentDeviceId) {
+          const reply = await remoteBackgroundInvoke(current.agentDeviceId, 'maker:usage:account', ['codex', current.providerId]);
+          if (reply.ok && reply.result && typeof reply.result === 'object') {
+            const data = reply.result as { providerId?: unknown; appServerBuckets?: Record<string, import('@cindy/maker-shared/codex-usage-buckets').BucketSnapshotLike> | null };
+            if (data.providerId !== undefined ? data.providerId === current.providerId : current.providerId === 'openai') {
+              codexBuckets = data.appServerBuckets ?? null;
+            }
+          }
+        } else {
+          const snap = await readCodexAccountUsageSnapshot(current.providerId).catch(() => null);
+          codexBuckets = snap?.appServerBuckets ?? null;
+        }
       } catch {
         codexBuckets = null;
       }
