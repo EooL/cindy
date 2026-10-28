@@ -247,8 +247,8 @@ def fetch_dynamic_agy_models():
                             "id": base_id,
                             "name": static_meta["name"] if static_meta else clean_name,
                             "backend": static_meta["backend"] if static_meta else vid,
-                            "efforts": [],
-                            "default_effort": static_meta.get("default_effort", "high") if static_meta else "high",
+                            "efforts": list(static_meta.get("efforts", [])) if static_meta else [],
+                            "default_effort": static_meta.get("default_effort") if static_meta else None,
                             "default_enabled": static_meta.get("default_enabled", True) if static_meta else True,
                             "supports_image": static_meta["supports_image"] if static_meta else ("gemini" in base_id or "claude" in base_id),
                             "supports_fast": False,
@@ -262,13 +262,7 @@ def fetch_dynamic_agy_models():
                         families[base_id]["efforts"].append(effort)
 
             if families:
-                # Merge into list
-                catalog = []
-                for b_id, m in families.items():
-                    if not m["efforts"]:
-                        m["efforts"] = ["low", "medium", "high"]
-                    catalog.append(m)
-                return catalog
+                return list(families.values())
     except Exception as e:
         print(f"[WARN] Error in fetch_dynamic_agy_models: {e}", file=sys.stderr)
     return []
@@ -726,15 +720,21 @@ def sanitize_schema(node, defs=None, depth=0, ref_depth=0, active_refs=None):
     if isinstance(node.get("format"), str):
         out["format"] = node["format"]
 
-    # Enum / const
-    if "const" in node and node["const"] is not None:
-        out["enum"] = [str(node["const"])]
+    # Enum / const: only string values are supported by Google Cloud Code Assist Schema
+    if "const" in node and isinstance(node["const"], str):
+        out["enum"] = [node["const"]]
         if "type" not in out:
             out["type"] = "STRING"
     elif isinstance(node.get("enum"), list):
-        vals = [str(x) for x in node["enum"] if x is not None]
+        vals = [x for x in node["enum"] if isinstance(x, str)]
         if vals:
-            out["enum"] = vals
+            seen = set()
+            deduped = []
+            for x in vals:
+                if x not in seen:
+                    seen.add(x)
+                    deduped.append(x)
+            out["enum"] = deduped
             if "type" not in out:
                 out["type"] = "STRING"
 
@@ -949,6 +949,25 @@ def build_cca_request(openai_req):
                 fn_decls.append(decl)
     if fn_decls:
         req_inner["tools"] = [{"functionDeclarations": fn_decls}]
+        tool_choice = openai_req.get("tool_choice")
+        if tool_choice:
+            fcc = None
+            declared_names = {d["name"] for d in fn_decls}
+            if isinstance(tool_choice, str):
+                tc_lower = tool_choice.lower()
+                if tc_lower == "none":
+                    fcc = {"mode": "NONE"}
+                elif tc_lower == "auto":
+                    fcc = {"mode": "AUTO"}
+                elif tc_lower == "required":
+                    fcc = {"mode": "ANY"}
+            elif isinstance(tool_choice, dict):
+                fn_obj = tool_choice.get("function") or tool_choice
+                target_name = fn_obj.get("name") if isinstance(fn_obj, dict) else None
+                if target_name and target_name in declared_names:
+                    fcc = {"mode": "ANY", "allowedFunctionNames": [target_name]}
+            if fcc:
+                req_inner["toolConfig"] = {"functionCallingConfig": fcc}
 
     gen_cfg = {}
     if "temperature" in openai_req and openai_req["temperature"] is not None:
@@ -1011,7 +1030,9 @@ def map_finish_reason(raw_finish, has_tool_calls=False):
         return "length"
     if rf in ("SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII"):
         return "content_filter"
-    if rf in ("MALFORMED_FUNCTION_CALL", "OTHER"):
+    if "SAFETY" in rf or "BLOCK" in rf or "PROHIBIT" in rf:
+        return "content_filter"
+    if rf in ("MALFORMED_FUNCTION_CALL", "OTHER", "ERROR"):
         return "error"
     if rf in ("STOP", "END_OF_TURN"):
         return "tool_calls" if has_tool_calls else "stop"
@@ -1111,13 +1132,15 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                 meta = {
                     "name": m["name"],
                     "description": m.get("description", ""),
-                    "efforts": m.get("efforts", ["low", "medium", "high"]),
-                    "defaultEffort": m.get("default_effort", "high"),
                     "supportsImageInput": bool(m.get("supports_image", True)),
                     "supportsFastMode": bool(m.get("supports_fast", False)),
                     "supportsToolCalls": True,
                     "modalities": modalities,
                 }
+                if m.get("efforts"):
+                    meta["efforts"] = m["efforts"]
+                if m.get("default_effort"):
+                    meta["defaultEffort"] = m["default_effort"]
                 if m.get("context_window") is not None:
                     meta["contextWindow"] = m["context_window"]
                     meta["contextWindowMax"] = m["context_window"]
@@ -1228,6 +1251,10 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                     inner = event.get("response") or event
                     if "usageMetadata" in inner:
                         usage_meta = inner["usageMetadata"]
+                    if inner.get("promptFeedback") and isinstance(inner["promptFeedback"], dict):
+                        pf_block = inner["promptFeedback"].get("blockReason")
+                        if pf_block and not last_finish_reason:
+                            last_finish_reason = pf_block
                     if inner.get("finishReason"):
                         last_finish_reason = inner["finishReason"]
 
@@ -1341,6 +1368,10 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                     inner = event.get("response") or event
                     if "usageMetadata" in inner:
                         usage_meta = inner["usageMetadata"]
+                    if inner.get("promptFeedback") and isinstance(inner["promptFeedback"], dict):
+                        pf_block = inner["promptFeedback"].get("blockReason")
+                        if pf_block and not last_finish_reason:
+                            last_finish_reason = pf_block
                     if inner.get("finishReason"):
                         last_finish_reason = inner["finishReason"]
                     for cand in inner.get("candidates") or []:

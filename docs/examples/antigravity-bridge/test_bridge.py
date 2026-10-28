@@ -152,6 +152,20 @@ class SanitizeSchemaTest(unittest.TestCase):
             "enum": ["pending", "in_progress", "completed", "deleted"],
         })
 
+    def test_drops_non_string_enums(self):
+        # Numeric enums should be dropped rather than coerced to strings, avoiding invalid schema
+        schema = {
+            "type": "object",
+            "properties": {
+                "count": {"type": "integer", "enum": [1, 2, 3]},
+                "tag": {"type": "string", "enum": ["a", "b"]},
+            },
+        }
+        out = bridge.sanitize_schema(schema)
+        self.assertEqual(out["properties"]["count"], {"type": "INTEGER"})
+        self.assertNotIn("enum", out["properties"]["count"])
+        self.assertEqual(out["properties"]["tag"], {"type": "STRING", "enum": ["a", "b"]})
+
 
 class BridgeSecurityAndUpstreamTest(unittest.TestCase):
     def test_re_module_imported(self):
@@ -268,6 +282,61 @@ class BridgeSecurityAndUpstreamTest(unittest.TestCase):
         self.assertEqual(final_usage["completion_tokens"], 250)
         self.assertEqual(final_usage["total_tokens"], 350)
         self.assertEqual(final_usage["completion_tokens_details"]["reasoning_tokens"], 200)
+
+    def test_unsuffixed_unknown_models_have_no_fabricated_efforts(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
+            mock_run.return_value.stdout = "unknown-custom-model\tUnknown Custom Model\n"
+            models = bridge.fetch_dynamic_agy_models()
+            self.assertEqual(len(models), 1)
+            self.assertEqual(models[0]["efforts"], [])
+            self.assertIsNone(models[0].get("default_effort"))
+
+    def test_tool_choice_translation_to_function_calling_config(self):
+        base_req = {
+            "model": "gemini-4-argon",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "search_docs",
+                    "description": "search",
+                    "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
+                },
+            }],
+        }
+        # tool_choice: none
+        req_none = {**base_req, "tool_choice": "none"}
+        env_none, _, _ = bridge.build_cca_request(req_none)
+        self.assertEqual(env_none["request"]["toolConfig"]["functionCallingConfig"]["mode"], "NONE")
+
+        # tool_choice: required
+        req_req = {**base_req, "tool_choice": "required"}
+        env_req, _, _ = bridge.build_cca_request(req_req)
+        self.assertEqual(env_req["request"]["toolConfig"]["functionCallingConfig"]["mode"], "ANY")
+
+        # tool_choice: auto
+        req_auto = {**base_req, "tool_choice": "auto"}
+        env_auto, _, _ = bridge.build_cca_request(req_auto)
+        self.assertEqual(env_auto["request"]["toolConfig"]["functionCallingConfig"]["mode"], "AUTO")
+
+        # tool_choice: named function
+        req_named = {**base_req, "tool_choice": {"type": "function", "function": {"name": "search_docs"}}}
+        env_named, _, _ = bridge.build_cca_request(req_named)
+        self.assertEqual(env_named["request"]["toolConfig"]["functionCallingConfig"], {
+            "mode": "ANY",
+            "allowedFunctionNames": ["search_docs"],
+        })
+
+        # tool_choice: named unknown function ignored / not set
+        req_bad = {**base_req, "tool_choice": {"type": "function", "function": {"name": "non_existent"}}}
+        env_bad, _, _ = bridge.build_cca_request(req_bad)
+        self.assertNotIn("toolConfig", env_bad["request"])
+
+    def test_prompt_feedback_safety_block_mapping(self):
+        self.assertEqual(bridge.map_finish_reason("PROMPT_BLOCKED_SAFETY"), "content_filter")
+        self.assertEqual(bridge.map_finish_reason("BLOCKLIST"), "content_filter")
+        self.assertEqual(bridge.map_finish_reason("PROHIBITED_CONTENT"), "content_filter")
 
 
 if __name__ == "__main__":
