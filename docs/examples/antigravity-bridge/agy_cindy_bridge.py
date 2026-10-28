@@ -14,6 +14,7 @@ import datetime
 import http.server
 import json
 import os
+import re
 import socketserver
 import subprocess
 import sys
@@ -25,12 +26,35 @@ import uuid
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("AGY_BRIDGE_PORT", "11436"))
+BRIDGE_SECRET = os.environ.get("AGY_BRIDGE_SECRET")
 UPSTREAM_BASE = "https://daily-cloudcode-pa.googleapis.com"
 AGY_BIN = os.path.expandvars(r"%LOCALAPPDATA%\agy\bin\agy.exe")
 KEYRING_TARGET = "gemini:antigravity"
 USER_AGENT = "antigravity/1.0.0 windows/amd64"
 PAID_TIER_HEADER = "CAE="
-QUOTA_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "quota_cache.json")
+
+def _get_cache_dir():
+    override = os.environ.get("AGY_BRIDGE_CACHE_DIR")
+    if override:
+        path = override
+    elif os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        path = os.path.join(base, "CindyGlobal", "antigravity-bridge")
+    else:
+        base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+        path = os.path.join(base, "cindy", "antigravity-bridge")
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception:
+        pass
+    return path
+
+CACHE_DIR = _get_cache_dir()
+QUOTA_CACHE_FILE = os.path.join(CACHE_DIR, "quota_cache.json")
+ALLOWED_ORIGIN_REGEX = re.compile(
+    r"^(https?://(?:localhost|127\.0\.0\.1)(?::\d+)?|tauri://localhost|vscode-webview://.*)$",
+    re.IGNORECASE,
+)
 
 AGY_MODELS_CACHE = {"ts": 0.0, "data": []}
 AGY_CACHE_LOCK = threading.Lock()
@@ -722,6 +746,16 @@ def build_cca_request(openai_req):
         or alias_effort
         or model_info.get("default_effort")
     )
+    if req_effort:
+        effort_key = str(req_effort).lower()
+        variant = f"{lookup_model}-{effort_key}"
+        if variant in MODEL_ALIASES:
+            backend_model = MODEL_ALIASES[variant][0]
+        else:
+            for m in get_dynamic_agy_models():
+                if m.get("id") == variant:
+                    backend_model = m.get("backend", variant)
+                    break
 
     messages = openai_req.get("messages") or []
     system_texts = []
@@ -865,6 +899,17 @@ def build_cca_request(openai_req):
     if max_tok and int(max_tok) > 0:
         gen_cfg["maxOutputTokens"] = min(int(max_tok), 65536)
 
+    if req_effort:
+        effort_key = str(req_effort).lower()
+        if effort_key == "minimal":
+            gen_cfg["thinkingConfig"] = {"thinkingBudget": 0}
+        else:
+            budget = EFFORT_TO_BUDGET.get(effort_key, model_info.get("thinking_budget", 0))
+            if budget > 0:
+                gen_cfg["thinkingConfig"] = {"thinkingBudget": budget}
+    elif model_info.get("thinking_budget", 0) > 0:
+        gen_cfg["thinkingConfig"] = {"thinkingBudget": model_info["thinking_budget"]}
+
     if gen_cfg:
         req_inner["generationConfig"] = gen_cfg
 
@@ -897,21 +942,46 @@ def open_upstream_stream(envelope):
             headers["Authorization"] = f"Bearer {token}"
             req = urllib.request.Request(url, data=data, headers=headers, method="POST")
             return urllib.request.urlopen(req, timeout=120)
-        elif e.code == 429 and envelope.get("model") != "gemini-3.8-flash-tiered":
-            envelope["model"] = "gemini-3.8-flash-tiered"
-            envelope["requestId"] = str(uuid.uuid4())
-            data = json.dumps(envelope).encode("utf-8")
-            req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-            return urllib.request.urlopen(req, timeout=120)
         raise
 
 
 class BridgeHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    def _set_cors_headers(self):
+        origin = self.headers.get("Origin")
+        if origin and ALLOWED_ORIGIN_REGEX.match(origin):
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+
+    def _check_origin_and_auth(self):
+        origin = self.headers.get("Origin")
+        if origin and not ALLOWED_ORIGIN_REGEX.match(origin):
+            self._send_json(403, {
+                "error": {
+                    "message": f"Forbidden: untrusted origin '{origin}'",
+                    "type": "cors_error",
+                    "code": 403,
+                }
+            })
+            return False
+
+        if BRIDGE_SECRET:
+            auth = self.headers.get("Authorization", "")
+            if auth != f"Bearer {BRIDGE_SECRET}":
+                self._send_json(401, {
+                    "error": {
+                        "message": "Unauthorized: missing or invalid bridge secret",
+                        "type": "auth_error",
+                        "code": 401,
+                    }
+                })
+                return False
+        return True
+
     def log_message(self, fmt, *args):
         try:
-            log_path = os.path.join(os.path.dirname(__file__), "bridge.log")
+            log_path = os.path.join(CACHE_DIR, "bridge.log")
             with open(log_path, "a", encoding="utf-8") as lf:
                 lf.write(f"[{datetime.datetime.now().isoformat()}] {fmt % args}\n")
         except Exception:
@@ -922,19 +992,21 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self._set_cors_headers()
         self.end_headers()
         self.wfile.write(body)
 
     def do_OPTIONS(self):
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self._set_cors_headers()
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Requested-With")
         self.send_header("Content-Length", "0")
         self.end_headers()
 
     def do_GET(self):
+        if not self._check_origin_and_auth():
+            return
         path = self.path.split("?", 1)[0]
         if path in ("/health", "/v1/health"):
             tok = read_keyring_token()
@@ -993,6 +1065,8 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
         self._send_json(404, {"error": {"message": f"Not found: {path}"}})
 
     def do_POST(self):
+        if not self._check_origin_and_auth():
+            return
         path = self.path.split("?", 1)[0]
         if path not in ("/v1/chat/completions", "/chat/completions"):
             self._send_json(404, {"error": {"message": f"Not found: {path}"}})
@@ -1037,7 +1111,7 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "close")
-            self.send_header("Access-Control-Allow-Origin", "*")
+            self._set_cors_headers()
             self.end_headers()
 
             def send_sse(obj):
@@ -1239,7 +1313,7 @@ def main():
     threading.Thread(target=quota_poller_loop, daemon=True).start()
     server = ThreadedHTTPServer((HOST, PORT), BridgeHandler)
     try:
-        log_path = os.path.join(os.path.dirname(__file__), "bridge.log")
+        log_path = os.path.join(CACHE_DIR, "bridge.log")
         with open(log_path, "a", encoding="utf-8") as lf:
             lf.write(f"[{datetime.datetime.now().isoformat()}] Listening on http://{HOST}:{PORT}/v1\n")
     except Exception:

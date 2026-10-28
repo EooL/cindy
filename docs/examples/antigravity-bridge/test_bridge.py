@@ -27,5 +27,43 @@ class SanitizeSchemaTest(unittest.TestCase):
         self.assertEqual(out, {"type": "INTEGER", "nullable": True})
 
 
+class BridgeSecurityAndUpstreamTest(unittest.TestCase):
+    def test_re_module_imported(self):
+        self.assertTrue(hasattr(bridge, "re"))
+
+    def test_quota_cache_location_not_in_checkout(self):
+        checkout_dir = os.path.dirname(os.path.abspath(__file__))
+        self.assertFalse(os.path.abspath(bridge.QUOTA_CACHE_FILE).startswith(checkout_dir))
+
+    def test_cors_origin_filter(self):
+        self.assertTrue(bool(bridge.ALLOWED_ORIGIN_REGEX.match("http://localhost:3000")))
+        self.assertTrue(bool(bridge.ALLOWED_ORIGIN_REGEX.match("http://127.0.0.1:8080")))
+        self.assertTrue(bool(bridge.ALLOWED_ORIGIN_REGEX.match("tauri://localhost")))
+        self.assertTrue(bool(bridge.ALLOWED_ORIGIN_REGEX.match("vscode-webview://random-token")))
+        self.assertFalse(bool(bridge.ALLOWED_ORIGIN_REGEX.match("https://evil.com")))
+        self.assertFalse(bool(bridge.ALLOWED_ORIGIN_REGEX.match("http://attacker.com:11436")))
+
+    def test_reasoning_effort_applied_upstream(self):
+        req_low = {
+            "model": "gemini-4-argon",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "low",
+        }
+        env_low, _, _ = bridge.build_cca_request(req_low)
+        gen_cfg_low = env_low["request"].get("generationConfig", {})
+        self.assertIn("thinkingConfig", gen_cfg_low)
+        self.assertEqual(gen_cfg_low["thinkingConfig"]["thinkingBudget"], 8192)
+
+        req_min = {
+            "model": "gemini-4-argon",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "minimal",
+        }
+        env_min, _, _ = bridge.build_cca_request(req_min)
+        gen_cfg_min = env_min["request"].get("generationConfig", {})
+        self.assertIn("thinkingConfig", gen_cfg_min)
+        self.assertEqual(gen_cfg_min["thinkingConfig"]["thinkingBudget"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
