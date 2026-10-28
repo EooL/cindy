@@ -56,81 +56,6 @@ ALLOWED_ORIGIN_REGEX = re.compile(
     re.IGNORECASE,
 )
 
-AGY_MODELS_CACHE = {"ts": 0.0, "data": []}
-AGY_CACHE_LOCK = threading.Lock()
-
-def fetch_dynamic_agy_models():
-    """Dynamically queries `agy models` to discover active models and reasoning efforts."""
-    try:
-        res = subprocess.run(
-            "agy models",
-            shell=True,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-            timeout=15
-        )
-        if res.returncode == 0 and res.stdout:
-            families = {}
-            for line in res.stdout.splitlines():
-                line = line.strip()
-                if not line or "Fetching" in line:
-                    continue
-                parts = line.split("\t")
-                if len(parts) >= 2:
-                    vid, name_full = parts[0].strip(), parts[1].strip()
-                    m = re.match(r"^(.*?)-(low|medium|high|xhigh|max|minimal)$", vid)
-                    if m:
-                        base_id, effort = m.group(1), m.group(2)
-                    else:
-                        base_id, effort = vid, None
-                    clean_name = re.sub(r"\s*\((Low|Medium|High|Max|Minimal)\)\s*$", "", name_full)
-                    if base_id not in families:
-                        ctx = 200000 if "claude" in base_id else 1000000
-                        max_out = 64000 if "claude" in base_id else 65536
-                        families[base_id] = {
-                            "id": base_id,
-                            "name": clean_name,
-                            "backend": vid,
-                            "context_window": ctx,
-                            "max_output": max_out,
-                            "efforts": [],
-                            "default_effort": "high",
-                            "default_enabled": True,
-                            "supports_image": True if "gemini" in base_id or "claude" in base_id else False,
-                            "supports_fast": False,
-                            "description": f"Live dynamic Google Antigravity model ({clean_name}).",
-                        }
-                    if effort and effort not in families[base_id]["efforts"]:
-                        families[base_id]["efforts"].append(effort)
-
-            if families:
-                # Merge into list
-                catalog = []
-                for b_id, m in families.items():
-                    if not m["efforts"]:
-                        m["efforts"] = ["low", "medium", "high"]
-                    catalog.append(m)
-                return catalog
-    except Exception as e:
-        print(f"[WARN] Error in fetch_dynamic_agy_models: {e}", file=sys.stderr)
-    return []
-
-def get_dynamic_agy_models(force=False):
-    now = time.time()
-    with AGY_CACHE_LOCK:
-        if not force and AGY_MODELS_CACHE["data"] and (now - AGY_MODELS_CACHE["ts"] < 1800): # 30 min cache
-            return AGY_MODELS_CACHE["data"]
-
-    new_models = fetch_dynamic_agy_models()
-    if new_models:
-        with AGY_CACHE_LOCK:
-            AGY_MODELS_CACHE["data"] = new_models
-            AGY_MODELS_CACHE["ts"] = now
-        return new_models
-
-    return AGY_MODELS_CACHE.get("data") or MODEL_CATALOG
 
 # Baseline model catalog (fallback if agy CLI is currently running a busy turn)
 MODEL_CATALOG = [
@@ -285,6 +210,84 @@ EFFORT_TO_BUDGET = {
     "max": 32768,
     "ultra": 32768,
 }
+
+AGY_MODELS_CACHE = {"ts": 0.0, "data": []}
+AGY_CACHE_LOCK = threading.Lock()
+
+def fetch_dynamic_agy_models():
+    """Dynamically queries `agy models` to discover active models and reasoning efforts."""
+    try:
+        res = subprocess.run(
+            "agy models",
+            shell=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            timeout=15
+        )
+        if res.returncode == 0 and res.stdout:
+            families = {}
+            for line in res.stdout.splitlines():
+                line = line.strip()
+                if not line or "Fetching" in line:
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 2:
+                    vid, name_full = parts[0].strip(), parts[1].strip()
+                    m = re.match(r"^(.*?)-(low|medium|high|xhigh|max|minimal)$", vid)
+                    if m:
+                        base_id, effort = m.group(1), m.group(2)
+                    else:
+                        base_id, effort = vid, None
+                    clean_name = re.sub(r"\s*\((Low|Medium|High|Max|Minimal)\)\s*$", "", name_full)
+                    static_meta = MODEL_MAP.get(base_id)
+                    if base_id not in families:
+                        families[base_id] = {
+                            "id": base_id,
+                            "name": static_meta["name"] if static_meta else clean_name,
+                            "backend": static_meta["backend"] if static_meta else vid,
+                            "efforts": [],
+                            "default_effort": static_meta.get("default_effort", "high") if static_meta else "high",
+                            "default_enabled": static_meta.get("default_enabled", True) if static_meta else True,
+                            "supports_image": static_meta["supports_image"] if static_meta else ("gemini" in base_id or "claude" in base_id),
+                            "supports_fast": False,
+                            "description": static_meta["description"] if static_meta else f"Live dynamic Google Antigravity model ({clean_name}).",
+                        }
+                        if static_meta and "context_window" in static_meta:
+                            families[base_id]["context_window"] = static_meta["context_window"]
+                        if static_meta and "max_output" in static_meta:
+                            families[base_id]["max_output"] = static_meta["max_output"]
+                    if effort and effort not in families[base_id]["efforts"]:
+                        families[base_id]["efforts"].append(effort)
+
+            if families:
+                # Merge into list
+                catalog = []
+                for b_id, m in families.items():
+                    if not m["efforts"]:
+                        m["efforts"] = ["low", "medium", "high"]
+                    catalog.append(m)
+                return catalog
+    except Exception as e:
+        print(f"[WARN] Error in fetch_dynamic_agy_models: {e}", file=sys.stderr)
+    return []
+
+def get_dynamic_agy_models(force=False):
+    now = time.time()
+    with AGY_CACHE_LOCK:
+        if not force and AGY_MODELS_CACHE["data"] and (now - AGY_MODELS_CACHE["ts"] < 1800): # 30 min cache
+            return AGY_MODELS_CACHE["data"]
+
+    new_models = fetch_dynamic_agy_models()
+    if new_models:
+        with AGY_CACHE_LOCK:
+            AGY_MODELS_CACHE["data"] = new_models
+            AGY_MODELS_CACHE["ts"] = now
+        return new_models
+
+    return AGY_MODELS_CACHE.get("data") or MODEL_CATALOG
+
 
 THOUGHT_SIG_CACHE = {}
 CACHE_LOCK = threading.Lock()
@@ -655,21 +658,49 @@ def sanitize_schema(node, defs=None, depth=0, ref_depth=0, active_refs=None):
 
     out = {}
 
-    # Handle anyOf unions (such as nullable single-branch types)
+    # Handle anyOf unions (such as nullable single-branch types or multi-branch enum unions)
     if "anyOf" in node and isinstance(node["anyOf"], list):
-        non_null = [
+        non_null_branches = [
             b for b in node["anyOf"]
-            if not (isinstance(b, dict) and (b.get("type") == "null" or b.get("enum") == [None]))
+            if isinstance(b, dict) and not (b.get("type") == "null" or b.get("enum") == [None])
         ]
-        has_null = len(non_null) != len(node["anyOf"])
-        if len(non_null) == 1 and isinstance(non_null[0], dict):
-            merged = dict(non_null[0])
+        has_null = len(non_null_branches) != len(node["anyOf"])
+
+        if len(non_null_branches) == 1:
+            merged = dict(non_null_branches[0])
             if "description" in node and "description" not in merged:
                 merged["description"] = node["description"]
-            res = sanitize_schema(merged, defs, depth + 1, ref_depth, active_refs)
+            res = sanitize_schema(merged, defs, depth + 1 if depth == 0 else depth, ref_depth, active_refs)
             if has_null:
                 res["nullable"] = True
             return res
+
+        # Multi-branch enum union: collapse same-type enum branches (e.g. string enums across anyOf branches)
+        if non_null_branches:
+            branch_schemas = [
+                sanitize_schema(b, defs, depth + 1 if depth == 0 else depth, ref_depth, active_refs)
+                for b in non_null_branches
+            ]
+            first_type = branch_schemas[0].get("type")
+            same_type = all(s.get("type") == first_type for s in branch_schemas)
+            all_enum_only = all(
+                isinstance(s.get("enum"), list) and set(s.keys()).issubset({"type", "enum", "nullable"})
+                for s in branch_schemas
+            )
+            if same_type and all_enum_only and first_type not in (None, "NULL"):
+                merged_enum = []
+                seen_enums = set()
+                for s in branch_schemas:
+                    for val in s.get("enum", []):
+                        if val not in seen_enums:
+                            seen_enums.add(val)
+                            merged_enum.append(val)
+                res = {"type": first_type or "STRING", "enum": merged_enum}
+                if "description" in node:
+                    res["description"] = node["description"]
+                if has_null:
+                    res["nullable"] = True
+                return res
 
     # Type normalization
     node_type = node.get("type")
@@ -972,6 +1003,21 @@ def open_upstream_stream(envelope):
         raise
 
 
+def map_finish_reason(raw_finish, has_tool_calls=False):
+    if not raw_finish:
+        return "tool_calls" if has_tool_calls else "stop"
+    rf = str(raw_finish).upper()
+    if rf in ("MAX_TOKENS", "LENGTH"):
+        return "length"
+    if rf in ("SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII"):
+        return "content_filter"
+    if rf in ("MALFORMED_FUNCTION_CALL", "OTHER"):
+        return "error"
+    if rf in ("STOP", "END_OF_TURN"):
+        return "tool_calls" if has_tool_calls else "stop"
+    return "tool_calls" if has_tool_calls else "stop"
+
+
 class BridgeHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -1065,9 +1111,6 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                 meta = {
                     "name": m["name"],
                     "description": m.get("description", ""),
-                    "contextWindow": m["context_window"],
-                    "contextWindowMax": m["context_window"],
-                    "maxOutputTokens": m["max_output"],
                     "efforts": m.get("efforts", ["low", "medium", "high"]),
                     "defaultEffort": m.get("default_effort", "high"),
                     "supportsImageInput": bool(m.get("supports_image", True)),
@@ -1075,17 +1118,27 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                     "supportsToolCalls": True,
                     "modalities": modalities,
                 }
-                data.append({
+                if m.get("context_window") is not None:
+                    meta["contextWindow"] = m["context_window"]
+                    meta["contextWindowMax"] = m["context_window"]
+                if m.get("max_output") is not None:
+                    meta["maxOutputTokens"] = m["max_output"]
+
+                model_item = {
                     "id": m["id"],
                     "object": "model",
                     "created": now,
                     "owned_by": "google-antigravity",
                     "name": m["name"],
-                    "context_window": m["context_window"],
-                    "max_tokens": m["max_output"],
                     **meta,
                     "discoveredMetadata": meta,
-                })
+                }
+                if m.get("context_window") is not None:
+                    model_item["context_window"] = m["context_window"]
+                if m.get("max_output") is not None:
+                    model_item["max_tokens"] = m["max_output"]
+
+                data.append(model_item)
             self._send_json(200, {"object": "list", "data": data})
             return
 
@@ -1156,6 +1209,7 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
 
             tool_call_idx = 0
             saw_tool_calls = False
+            last_finish_reason = None
             usage_meta = {}
 
             try:
@@ -1174,9 +1228,13 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                     inner = event.get("response") or event
                     if "usageMetadata" in inner:
                         usage_meta = inner["usageMetadata"]
+                    if inner.get("finishReason"):
+                        last_finish_reason = inner["finishReason"]
 
                     candidates = inner.get("candidates") or []
                     for cand in candidates:
+                        if cand.get("finishReason"):
+                            last_finish_reason = cand["finishReason"]
                         parts = (cand.get("content") or {}).get("parts") or []
                         for part in parts:
                             sig = part.get("thoughtSignature")
@@ -1236,10 +1294,20 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
             finally:
                 resp.close()
 
-            finish_reason = "tool_calls" if saw_tool_calls else "stop"
+            finish_reason = map_finish_reason(last_finish_reason, saw_tool_calls)
             prompt_toks = usage_meta.get("promptTokenCount", 0)
             cand_toks = usage_meta.get("candidatesTokenCount", 0)
-            total_toks = usage_meta.get("totalTokenCount", prompt_toks + cand_toks)
+            thought_toks = usage_meta.get("thoughtsTokenCount", 0)
+            completion_toks = cand_toks + thought_toks
+            total_toks = usage_meta.get("totalTokenCount", prompt_toks + completion_toks)
+
+            final_usage = {
+                "prompt_tokens": prompt_toks,
+                "completion_tokens": completion_toks,
+                "total_tokens": total_toks,
+            }
+            if thought_toks:
+                final_usage["completion_tokens_details"] = {"reasoning_tokens": thought_toks}
 
             send_sse({
                 "id": chat_id,
@@ -1247,11 +1315,7 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                 "created": created,
                 "model": requested_model,
                 "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
-                "usage": {
-                    "prompt_tokens": prompt_toks,
-                    "completion_tokens": cand_toks,
-                    "total_tokens": total_toks,
-                },
+                "usage": final_usage,
             })
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
@@ -1260,6 +1324,7 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
             full_text = []
             reasoning_text = []
             tool_calls = []
+            last_finish_reason = None
             usage_meta = {}
             try:
                 for raw_line in resp:
@@ -1276,7 +1341,11 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                     inner = event.get("response") or event
                     if "usageMetadata" in inner:
                         usage_meta = inner["usageMetadata"]
+                    if inner.get("finishReason"):
+                        last_finish_reason = inner["finishReason"]
                     for cand in inner.get("candidates") or []:
+                        if cand.get("finishReason"):
+                            last_finish_reason = cand["finishReason"]
                         for part in (cand.get("content") or {}).get("parts") or []:
                             sig = part.get("thoughtSignature")
                             if part.get("thought") is True and part.get("text"):
@@ -1309,9 +1378,20 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
             if tool_calls:
                 msg_obj["tool_calls"] = tool_calls
 
+            finish_reason = map_finish_reason(last_finish_reason, bool(tool_calls))
             prompt_toks = usage_meta.get("promptTokenCount", 0)
             cand_toks = usage_meta.get("candidatesTokenCount", 0)
-            total_toks = usage_meta.get("totalTokenCount", prompt_toks + cand_toks)
+            thought_toks = usage_meta.get("thoughtsTokenCount", 0)
+            completion_toks = cand_toks + thought_toks
+            total_toks = usage_meta.get("totalTokenCount", prompt_toks + completion_toks)
+
+            final_usage = {
+                "prompt_tokens": prompt_toks,
+                "completion_tokens": completion_toks,
+                "total_tokens": total_toks,
+            }
+            if thought_toks:
+                final_usage["completion_tokens_details"] = {"reasoning_tokens": thought_toks}
 
             self._send_json(200, {
                 "id": chat_id,
@@ -1321,13 +1401,9 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                 "choices": [{
                     "index": 0,
                     "message": msg_obj,
-                    "finish_reason": "tool_calls" if tool_calls else "stop",
+                    "finish_reason": finish_reason,
                 }],
-                "usage": {
-                    "prompt_tokens": prompt_toks,
-                    "completion_tokens": cand_toks,
-                    "total_tokens": total_toks,
-                },
+                "usage": final_usage,
             })
 
 

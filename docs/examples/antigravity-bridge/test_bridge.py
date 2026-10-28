@@ -1,6 +1,7 @@
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import agy_cindy_bridge as bridge
@@ -130,6 +131,27 @@ class SanitizeSchemaTest(unittest.TestCase):
         self.assertNotIn("minimum", out["properties"]["limit"])
         self.assertNotIn("minItems", out["properties"]["tags"])
 
+    def test_multi_branch_enum_union(self):
+        # Regression from packages/model-compat/src/__tests__/upstream/adapters/google/google-tool-schema.test.js
+        schema = {
+            "type": "object",
+            "properties": {
+                "status": {
+                    "description": "New status for the task",
+                    "anyOf": [
+                        {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+                        {"type": "string", "enum": ["deleted"]},
+                    ],
+                },
+            },
+        }
+        out = bridge.sanitize_schema(schema)
+        self.assertEqual(out["properties"]["status"], {
+            "type": "STRING",
+            "description": "New status for the task",
+            "enum": ["pending", "in_progress", "completed", "deleted"],
+        })
+
 
 class BridgeSecurityAndUpstreamTest(unittest.TestCase):
     def test_re_module_imported(self):
@@ -188,6 +210,64 @@ class BridgeSecurityAndUpstreamTest(unittest.TestCase):
         }
         env_argon, _, _ = bridge.build_cca_request(req_argon)
         self.assertEqual(env_argon["model"], "gemini-3.8-flash-tiered")
+
+    def test_map_finish_reason(self):
+        self.assertEqual(bridge.map_finish_reason("STOP"), "stop")
+        self.assertEqual(bridge.map_finish_reason("STOP", has_tool_calls=True), "tool_calls")
+        self.assertEqual(bridge.map_finish_reason("MAX_TOKENS"), "length")
+        self.assertEqual(bridge.map_finish_reason("MAX_TOKENS", has_tool_calls=True), "length")
+        self.assertEqual(bridge.map_finish_reason("SAFETY"), "content_filter")
+        self.assertEqual(bridge.map_finish_reason("RECITATION"), "content_filter")
+        self.assertEqual(bridge.map_finish_reason("BLOCKLIST"), "content_filter")
+        self.assertEqual(bridge.map_finish_reason("MALFORMED_FUNCTION_CALL"), "error")
+        self.assertEqual(bridge.map_finish_reason(None, has_tool_calls=True), "tool_calls")
+        self.assertEqual(bridge.map_finish_reason(None, has_tool_calls=False), "stop")
+
+    def test_dynamic_models_merges_static_and_omits_unreported_limits(self):
+        gpt_oss = bridge.MODEL_MAP.get("gpt-oss-120b")
+        self.assertIsNotNone(gpt_oss)
+        self.assertEqual(gpt_oss["context_window"], 128000)
+        self.assertEqual(gpt_oss["max_output"], 32768)
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
+            mock_run.return_value.stdout = "gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\nunknown-custom-model\tUnknown Custom Model\n"
+            models = bridge.fetch_dynamic_agy_models()
+            model_by_id = {m["id"]: m for m in models}
+
+            # Known model retains verified static context & output tokens
+            self.assertEqual(model_by_id["gpt-oss-120b"]["context_window"], 128000)
+            self.assertEqual(model_by_id["gpt-oss-120b"]["max_output"], 32768)
+
+            # Unknown model does not guess 1M or 64k tokens
+            self.assertNotIn("context_window", model_by_id["unknown-custom-model"])
+            self.assertNotIn("max_output", model_by_id["unknown-custom-model"])
+
+    def test_thinking_tokens_added_to_completion_tokens(self):
+        usage_meta = {
+            "promptTokenCount": 100,
+            "candidatesTokenCount": 50,
+            "thoughtsTokenCount": 200,
+            "totalTokenCount": 350,
+        }
+        prompt_toks = usage_meta.get("promptTokenCount", 0)
+        cand_toks = usage_meta.get("candidatesTokenCount", 0)
+        thought_toks = usage_meta.get("thoughtsTokenCount", 0)
+        completion_toks = cand_toks + thought_toks
+        total_toks = usage_meta.get("totalTokenCount", prompt_toks + completion_toks)
+
+        final_usage = {
+            "prompt_tokens": prompt_toks,
+            "completion_tokens": completion_toks,
+            "total_tokens": total_toks,
+        }
+        if thought_toks:
+            final_usage["completion_tokens_details"] = {"reasoning_tokens": thought_toks}
+
+        self.assertEqual(final_usage["prompt_tokens"], 100)
+        self.assertEqual(final_usage["completion_tokens"], 250)
+        self.assertEqual(final_usage["total_tokens"], 350)
+        self.assertEqual(final_usage["completion_tokens_details"]["reasoning_tokens"], 200)
 
 
 if __name__ == "__main__":
