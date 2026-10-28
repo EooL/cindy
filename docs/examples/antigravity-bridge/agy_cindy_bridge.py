@@ -99,7 +99,7 @@ def fetch_dynamic_agy_models():
                             "default_effort": "high",
                             "default_enabled": True,
                             "supports_image": True if "gemini" in base_id or "claude" in base_id else False,
-                            "supports_fast": True if "flash" in base_id or "argon" in base_id or "oss" in base_id else False,
+                            "supports_fast": False,
                             "description": f"Live dynamic Google Antigravity model ({clean_name}).",
                         }
                     if effort and effort not in families[base_id]["efforts"]:
@@ -145,7 +145,7 @@ MODEL_CATALOG = [
         "default_effort": "high",
         "default_enabled": True,
         "supports_image": True,
-        "supports_fast": True,
+        "supports_fast": False,
         "description": "Flagship Google Antigravity model for complex coding, research, and agentic reasoning.",
     },
     {
@@ -159,7 +159,7 @@ MODEL_CATALOG = [
         "default_effort": "high",
         "default_enabled": True,
         "supports_image": True,
-        "supports_fast": True,
+        "supports_fast": False,
         "description": "High-speed multimodal reasoning model in Google Antigravity.",
     },
     {
@@ -187,7 +187,7 @@ MODEL_CATALOG = [
         "default_effort": "medium",
         "default_enabled": True,
         "supports_image": True,
-        "supports_fast": True,
+        "supports_fast": False,
         "description": "Anthropic Claude Sonnet 5.5 hosted via Google Antigravity subscription.",
     },
     {
@@ -215,7 +215,7 @@ MODEL_CATALOG = [
         "default_effort": "medium",
         "default_enabled": False,
         "supports_image": True,
-        "supports_fast": True,
+        "supports_fast": False,
         "description": "Balanced speed and intelligence for everyday coding tasks.",
     },
     {
@@ -229,7 +229,7 @@ MODEL_CATALOG = [
         "default_effort": "low",
         "default_enabled": False,
         "supports_image": True,
-        "supports_fast": True,
+        "supports_fast": False,
         "description": "Ultra-fast lightweight model for quick edits and completions.",
     },
     {
@@ -243,7 +243,7 @@ MODEL_CATALOG = [
         "default_effort": "medium",
         "default_enabled": False,
         "supports_image": True,
-        "supports_fast": True,
+        "supports_fast": False,
         "description": "Fast multimodal Gemini 2.5 model.",
     },
     {
@@ -257,7 +257,7 @@ MODEL_CATALOG = [
         "default_effort": "medium",
         "default_enabled": False,
         "supports_image": False,
-        "supports_fast": True,
+        "supports_fast": False,
         "description": "Open-weights 120B model hosted on Google Antigravity.",
     },
 ]
@@ -591,48 +591,71 @@ def quota_poller_loop():
         time.sleep(60)
 
 
-UNSUPPORTED_SCHEMA_KEYS = {
-    "$schema",
-    "$id",
-    "$ref",
-    "$defs",
-    "definitions",
-    "additionalProperties",
-    "patternProperties",
-    "unevaluatedProperties",
-    "propertyNames",
-    "dependentRequired",
-    "dependentSchemas",
-    "dependencies",
-    "default",
-    "examples",
-    "readOnly",
-    "writeOnly",
-    "deprecated",
-    "contentEncoding",
-    "contentMediaType",
-    "if",
-    "then",
-    "else",
-    "allOf",
-    "oneOf",
-    "not",
-    "strict",
-}
+ALLOWED_SCHEMA_TYPES = {"string", "integer", "number", "boolean", "array", "object"}
+STRICT_GOOGLE_SCHEMA_KEYS = {"format", "description", "nullable"}
 
 
-GEMINI_SCHEMA_PASSTHROUGH_KEYS = {
-    "format", "title", "description", "nullable", "required",
-    "minItems", "maxItems", "minProperties", "maxProperties",
-    "minLength", "maxLength", "pattern", "minimum", "maximum",
-    "example", "propertyOrdering",
-}
+def resolve_ref(ref_str, defs):
+    if not isinstance(ref_str, str):
+        return None
+    m = re.match(r"^#/(?:\$defs|definitions)/(.+)$", ref_str)
+    if not m:
+        return None
+    try:
+        key = urllib.parse.unquote(m.group(1).replace("~1", "/").replace("~0", "~"))
+        return defs.get(key)
+    except Exception:
+        return None
 
 
-def sanitize_schema(node):
+def collect_defs(root, defs):
+    if not isinstance(root, dict):
+        return
+    for bag in ("$defs", "definitions"):
+        group = root.get(bag)
+        if isinstance(group, dict):
+            for name, val in group.items():
+                if name not in defs:
+                    defs[name] = val
+
+
+def merge_ref_target(target, overlay):
+    merged = dict(target)
+    for k in ("type", "nullable", "description", "format", "enum", "const", "properties", "items", "required", "anyOf"):
+        if k in overlay:
+            merged[k] = overlay[k]
+    return merged
+
+
+def sanitize_schema(node, defs=None, depth=0, ref_depth=0, active_refs=None):
     if not isinstance(node, dict):
-        return {"type": "OBJECT"}
+        return {"type": "OBJECT", "properties": {}} if depth == 0 else {}
+    if defs is None:
+        defs = {}
+        collect_defs(node, defs)
+    if active_refs is None:
+        active_refs = set()
+
+    if depth >= 24:
+        return {}
+
+    # Dereference local $ref before removing definitions
+    ref = node.get("$ref")
+    if isinstance(ref, str) and ref_depth < 16:
+        target = resolve_ref(ref, defs)
+        if isinstance(target, dict):
+            if ref in active_refs:
+                return {}
+            active_refs.add(ref)
+            try:
+                merged = merge_ref_target(target, node)
+                return sanitize_schema(merged, defs, depth, ref_depth + 1, active_refs)
+            finally:
+                active_refs.discard(ref)
+
     out = {}
+
+    # Handle anyOf unions (such as nullable single-branch types)
     if "anyOf" in node and isinstance(node["anyOf"], list):
         non_null = [
             b for b in node["anyOf"]
@@ -643,65 +666,79 @@ def sanitize_schema(node):
             merged = dict(non_null[0])
             if "description" in node and "description" not in merged:
                 merged["description"] = node["description"]
-            res = sanitize_schema(merged)
+            res = sanitize_schema(merged, defs, depth + 1, ref_depth, active_refs)
             if has_null:
                 res["nullable"] = True
             return res
 
-    for k, v in node.items():
-        if k in UNSUPPORTED_SCHEMA_KEYS or k == "anyOf":
-            continue
-        if k == "const":
-            out["enum"] = [str(v)]
+    # Type normalization
+    node_type = node.get("type")
+    if isinstance(node_type, list):
+        non_null = [t for t in node_type if t != "null"]
+        if "null" in node_type:
+            out["nullable"] = True
+        if non_null and isinstance(non_null[0], str) and non_null[0].lower() in ALLOWED_SCHEMA_TYPES:
+            out["type"] = non_null[0].upper()
+    elif isinstance(node_type, str):
+        t_lower = node_type.lower()
+        if t_lower == "null":
             out["type"] = "STRING"
-            continue
-        if k == "type":
-            if isinstance(v, list):
-                non_null_t = [t for t in v if t != "null"]
-                if "null" in v:
-                    out["nullable"] = True
-                out["type"] = (non_null_t[0] if non_null_t else "string").upper()
-            elif isinstance(v, str):
-                if v == "null":
-                    out["type"] = "STRING"
-                    out["nullable"] = True
-                else:
-                    out["type"] = v.upper()
-            continue
-        if k == "properties" and isinstance(v, dict):
-            props = {}
-            for pk, pv in v.items():
-                if isinstance(pv, dict):
-                    props[pk] = sanitize_schema(pv)
-            out["properties"] = props
-            continue
-        if k == "items":
-            if isinstance(v, dict):
-                out["items"] = sanitize_schema(v)
-            elif isinstance(v, list) and v and isinstance(v[0], dict):
-                out["items"] = sanitize_schema(v[0])
-            continue
-        if k == "enum" and isinstance(v, list):
-            vals = [str(x) for x in v if x is not None]
-            if vals:
-                out["enum"] = vals
-                out["type"] = "STRING"
-            continue
-        # Gemini rejects any field outside its Schema message (e.g. "encrypted").
-        if k in GEMINI_SCHEMA_PASSTHROUGH_KEYS:
-            out[k] = v
+            out["nullable"] = True
+        elif t_lower in ALLOWED_SCHEMA_TYPES:
+            out["type"] = t_lower.upper()
 
-    if "properties" in out and "type" not in out:
-        out["type"] = "OBJECT"
-    if "required" in out and isinstance(out["required"], list):
-        props = out.get("properties", {})
-        req = [r for r in out["required"] if isinstance(r, str) and r in props]
+    # Pass through strict Google subset only (excludes title, minItems, minLength, minimum, etc.)
+    if isinstance(node.get("nullable"), bool):
+        out["nullable"] = node["nullable"]
+    if isinstance(node.get("description"), str):
+        out["description"] = node["description"]
+    if isinstance(node.get("format"), str):
+        out["format"] = node["format"]
+
+    # Enum / const
+    if "const" in node and node["const"] is not None:
+        out["enum"] = [str(node["const"])]
+        if "type" not in out:
+            out["type"] = "STRING"
+    elif isinstance(node.get("enum"), list):
+        vals = [str(x) for x in node["enum"] if x is not None]
+        if vals:
+            out["enum"] = vals
+            if "type" not in out:
+                out["type"] = "STRING"
+
+    # Properties (recursive)
+    if isinstance(node.get("properties"), dict):
+        props = {}
+        for prop_name, prop_val in node["properties"].items():
+            if isinstance(prop_val, dict):
+                props[prop_name] = sanitize_schema(prop_val, defs, depth + 1, ref_depth, active_refs)
+            else:
+                props[prop_name] = {"type": "STRING"}
+        out["properties"] = props
+        if "type" not in out:
+            out["type"] = "OBJECT"
+
+    # Required: only string names that exist in properties
+    if "properties" in out and isinstance(node.get("required"), list):
+        props = out["properties"]
+        req = [r for r in node["required"] if isinstance(r, str) and r in props]
         if req:
             out["required"] = req
-        else:
-            out.pop("required", None)
-    if "type" not in out:
+
+    # Items for array
+    if isinstance(node.get("items"), dict):
+        out["items"] = sanitize_schema(node["items"], defs, depth + 1, ref_depth, active_refs)
+        if "type" not in out:
+            out["type"] = "ARRAY"
+
+    if depth == 0:
+        out["type"] = "OBJECT"
+        if "properties" not in out:
+            out["properties"] = {}
+    elif "type" not in out:
         out["type"] = "STRING"
+
     return out
 
 
@@ -746,16 +783,6 @@ def build_cca_request(openai_req):
         or alias_effort
         or model_info.get("default_effort")
     )
-    if req_effort:
-        effort_key = str(req_effort).lower()
-        variant = f"{lookup_model}-{effort_key}"
-        if variant in MODEL_ALIASES:
-            backend_model = MODEL_ALIASES[variant][0]
-        else:
-            for m in get_dynamic_agy_models():
-                if m.get("id") == variant:
-                    backend_model = m.get("backend", variant)
-                    break
 
     messages = openai_req.get("messages") or []
     system_texts = []
@@ -1044,7 +1071,7 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                     "efforts": m.get("efforts", ["low", "medium", "high"]),
                     "defaultEffort": m.get("default_effort", "high"),
                     "supportsImageInput": bool(m.get("supports_image", True)),
-                    "supportsFastMode": bool(m.get("supports_fast", True)),
+                    "supportsFastMode": bool(m.get("supports_fast", False)),
                     "supportsToolCalls": True,
                     "modalities": modalities,
                 }
